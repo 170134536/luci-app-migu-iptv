@@ -1,0 +1,32 @@
+config migu 'main'
+	# 是否启用服务（1 启用 / 0 关闭）
+	option enabled '1'
+
+	# 监听端口与地址。0.0.0.0 表示允许局域网访问
+	option port '8788'
+	option host '0.0.0.0'
+
+	# 咪咕账号 ID（留空 = 游客模式，最高 540p）
+	# 免费账号到 720p；VIP 到蓝光 1080p / 原画 / 4K
+	option userId ''
+
+	# 咪咕登录令牌（等同登录态，务必只在自家路由器上保存，勿外传）
+	option token ''
+
+	# 画质档位：2=标清 540p, 3=高清 720p, 4=蓝光 1080p(VIP),
+	# 7=原画(VIP), 9=4K(VIP)
+	# 超出账号权益会自动降级到咪咕愿意给的档位
+	option rateType '3'
+
+	# H.265 / HDR（部分设备只有声无画时关闭 H265）
+	option enableH265 '1'
+	option enableHDR '1'
+
+	# 管理页密码（留空 = 管理页免登录，仅建议在可信局域网内）
+	option adminPassword ''
+
+	# 频道列表缓存时长（分钟）
+	option cacheMinutes '360'
+
+	# 调试日志
+	option debug '0'

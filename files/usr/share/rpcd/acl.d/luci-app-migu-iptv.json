@@ -1,0 +1,11 @@
+{
+	"luci-app-migu-iptv": {
+		"description": "Grant access to migu-iptv UCI config",
+		"read": {
+			"uci": [ "migu" ]
+		},
+		"write": {
+			"uci": [ "migu" ]
+		}
+	}
+}
