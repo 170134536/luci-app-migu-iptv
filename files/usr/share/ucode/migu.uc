@@ -35,7 +35,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 const APP_NAME = '咪咕直播';
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const DEFAULT_PORT = 8788;
 
 // 分组显示顺序：按正常电视台习惯，央视（CCTV1 开头）排最前，其余靠后。
@@ -52,7 +52,6 @@ const ERR_HINT = {
 // ---------- 全局状态 ----------
 let cfg = null;            // 运行时配置
 let connections = [];      // 活跃连接
-let sessions = {};         // 管理页会话 token -> 过期时间戳
 let chanCache = { at: 0, cates: null, channels: null };  // 频道列表缓存
 let streamCache = {};      // pid -> { url, at } 取流结果短缓存
 
@@ -67,7 +66,6 @@ function loadConfig() {
 		rateType: '3',
 		enableH265: '1',
 		enableHDR: '1',
-		adminPassword: '',
 		cacheMinutes: '360',
 		debug: '0',
 	};
@@ -90,7 +88,6 @@ function loadConfig() {
 	c.cacheMinutes = +c.cacheMinutes || 360;
 	c.userId = '' + (c.userId || '');
 	c.token = '' + (c.token || '');
-	c.adminPass = '' + (c.adminPassword || '');
 	c.isGuest = (c.userId === '' || c.token === '');
 
 	return c;
@@ -404,15 +401,6 @@ function parseHead(head) {
 	return { method: method, path: path, headers: headers };
 }
 
-function parseJsonBody(body) {
-	if (type(body) !== 'string' || length(body) === 0) return {};
-	try {
-		let j = json(body);
-		if (type(j) === 'object' && j !== null) return j;
-	} catch (e) { }
-	return {};
-}
-
 // ---------- 播放列表 ----------
 function buildM3u(host) {
 	let groups = allChannels();
@@ -441,143 +429,10 @@ function buildTxt(host) {
 	return join('\n', lines) + '\n';
 }
 
-// ---------- 管理页 ----------
-
-// 生成会话 token（用 openssl 产生真随机值；ucode 没有全局 rand()）
-function newSession() {
-	let t = trim(sh("openssl rand -hex 16") || '');
-	if (t === '') t = sprintf('%d%d', time(), length(sessions));
-	sessions[t] = time() + 86400;
-	return t;
-}
-
-function validSession(req) {
-	let ck = req.headers['cookie'] || '';
-	let m = match(ck, /migu_admin=([^;\s]+)/);
-	if (!m) return false;
-	let t = m[1];
-	if (sessions[t] && sessions[t] > time()) return true;
-	return false;
-}
-
-// 删除会话（ucode 无 delete 运算符，重建表）
-function deleteSession(t) {
-	let ns = {};
-	for (let k in sessions)
-		if (k !== t) ns[k] = sessions[k];
-	sessions = ns;
-}
-
-function adminEnabled() {
-	return cfg.adminPass !== '';
-}
-
-function adminCss() {
-	return ':root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--line:#2a2f3a;--fg:#e6e9ef;--dim:#9aa4b2;--accent:#4c8dff;--accent2:#3a6fd8;--ok:#35c26b;--warn:#e0a83a;--err:#e5544b}' +
-		'*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif}' +
-		'.wrap{max-width:1000px;margin:0 auto;padding:20px}header{display:flex;align-items:center;gap:12px;padding:16px 20px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}' +
-		'header h1{font-size:17px;margin:0;font-weight:600}.sp{flex:1}.badge{font-size:12px;padding:2px 9px;border-radius:99px;border:1px solid var(--line);background:var(--panel2);color:var(--dim)}' +
-		'.badge.ok{color:var(--ok);border-color:#1e4a30}.badge.warn{color:var(--warn);border-color:#4a3d1e}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}' +
-		'.card h2{font-size:14px;margin:0 0 4px;font-weight:600}.card .desc{color:var(--dim);font-size:12.5px;margin:0 0 14px}label{display:block;font-size:12.5px;color:var(--dim);margin-bottom:5px}' +
-		'input[type=text],input[type=password],input[type=number],select{width:100%;padding:9px 11px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;font-size:13.5px;font-family:inherit}' +
-		'input:focus,select:focus{outline:none;border-color:var(--accent)}.field{margin-bottom:14px}button{cursor:pointer;border:1px solid var(--line);background:var(--panel2);color:var(--fg);padding:8px 15px;border-radius:7px;font-size:13px;font-family:inherit}' +
-		'button:hover{border-color:var(--accent)}button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:500}code,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}' +
-		'.kv{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line)}.kv:last-child{border-bottom:none}.kv .k{color:var(--dim)}' +
-		'.toast{position:fixed;right:18px;bottom:18px;z-index:99}.toast div{padding:11px 15px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);margin-top:8px;font-size:13px}' +
-		'.toast div.ok{border-color:#1e4a30;color:#9fe8bd}.toast div.err{border-color:#4a201e;color:#ffb3ae}' +
-		'.login{max-width:370px;margin:11vh auto;padding:0 20px}.login .card{padding:26px}.login h1{font-size:19px;margin:0 0 6px;font-weight:600}' +
-		'.hint{color:var(--dim);font-size:12px;margin-top:7px}.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:190px}' +
-		'.sw{position:relative;display:inline-block;width:38px;height:21px;vertical-align:middle}.sw input{opacity:0;width:0;height:0}.sw span{position:absolute;inset:0;background:#39404d;border-radius:99px;transition:.2s}' +
-		'.sw span:before{content:"";position:absolute;width:15px;height:15px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.sw input:checked+span{background:var(--ok)}.sw input:checked+span:before{transform:translateX(17px)}';
-}
-
-// 转义 HTML 属性（管理页表单回填用）
-function escAttr(s) {
-	return replace(replace(replace(replace('' + s, '&', '&amp;'), '"', '&quot;'), '<', '&lt;'), '>', '&gt;');
-}
-
-// 下拉选项（画质）
-function opt(v, label, cur) {
-	return '<option value="' + v + '"' + (cur == v ? ' selected' : '') + '>' + label + '</option>';
-}
-
-function adminPage(req, loggedIn) {
-	let groups = allChannels();
-	let total = 0;
-	for (let g in groups) total += length(g.dataList);
-
-	let statusBadge = cfg.isGuest
-		? '<span class="badge warn">游客模式（最高 540p）</span>'
-		: '<span class="badge ok">已填账号（最高受 VIP 决定）</span>';
-
-	let m3uHost = req.headers['host'] || (cfg.host + ':' + cfg.port);
-
-	let h = '';
-	h += '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">';
-	h += '<meta name="viewport" content="width=device-width,initial-scale=1">';
-	h += '<title>' + APP_NAME + ' · 管理</title><style>' + adminCss() + '</style></head><body>';
-	h += '<header><h1>' + APP_NAME + '</h1>' + statusBadge +
-		'<span class="badge">v' + APP_VERSION + '</span><span class="sp"></span>';
-	if (loggedIn) h += '<a href="/admin/logout" style="color:var(--dim);text-decoration:none;font-size:13px">退出</a>';
-	h += '</header><div class="wrap">';
-
-	// 订阅地址卡片
-	h += '<div class="card"><h2>订阅地址（TV-BOX 用）</h2>';
-	h += '<p class="desc">在 IPTV 播放器（TiviMate / IPTV Pro / Kodi 等）里添加下面的地址即可。</p>';
-	h += '<div class="kv"><span class="k">M3U 播放列表</span><code id="m3u">http://' + m3uHost + '/m3u</code></div>';
-	h += '<div class="kv"><span class="k">TXT 播放列表</span><code>http://' + m3uHost + '/txt</code></div>';
-	h += '<div class="kv"><span class="k">频道总数</span><span>' + total + ' 个（' + length(groups) + ' 个分组）</span></div>';
-	h += '<p class="hint">频道在播放时才实时取流，地址短期有效、自动续期。</p></div>';
-
-	// 账号配置卡片
-	h += '<div class="card"><h2>咪咕账号（决定画质上限）</h2>';
-	h += '<p class="desc">不填 = 游客模式（最高 540p）；填免费账号到 720p；VIP 到蓝光 / 原画 / 4K。</p>';
-	h += '<div class="field"><label for="fUser">咪咕账号 ID（userId）</label>';
-	h += '<input type="text" id="fUser" placeholder="留空为游客" value="' + escAttr(cfg.userId) + '"></div>';
-	h += '<div class="field"><label for="fToken">咪咕 Token</label>';
-	h += '<input type="password" id="fToken" placeholder="留空为游客（等同登录态，勿外传）" value="' + escAttr(cfg.token) + '"></div>';
-	h += '<div class="field"><label for="fRate">画质</label><select id="fRate">';
-	h += opt(2, '标清 540p', cfg.rateType);
-	h += opt(3, '高清 720p', cfg.rateType);
-	h += opt(4, '蓝光 1080p（需 VIP）', cfg.rateType);
-	h += opt(7, '原画 1080p+（需 VIP）', cfg.rateType);
-	h += opt(9, '4K 2160p（需 VIP）', cfg.rateType);
-	h += '</select></div>';
-	h += '<div class="row"><div><label class="row" style="align-items:center;gap:9px;cursor:pointer;color:var(--fg)"><span class="sw"><input type="checkbox" id="fH265"' + (cfg.enableH265 ? ' checked' : '') + '><span></span></span><span>H.265（部分设备只有声无画时关闭）</span></label></div>';
-	h += '<div><label class="row" style="align-items:center;gap:9px;cursor:pointer;color:var(--fg)"><span class="sw"><input type="checkbox" id="fHDR"' + (cfg.enableHDR ? ' checked' : '') + '><span></span></span><span>HDR</span></label></div></div>';
-	h += '<p class="hint">token 获取：浏览器登录咪咕后，F12 网络面板找 play.miguvideo.com 请求的 UserId / UserToken 请求头；或从咪咕 App 抓包。</p>';
-	h += '<button class="primary" onclick="saveCfg()">保存配置</button></div>';
-
-	// 测试卡片
-	h += '<div class="card"><h2>测试取流</h2><p class="desc">输入频道 ID（pID）测试能否取到流。</p>';
-	h += '<div class="row"><div><label for="fTest">频道 pID</label><input type="text" id="fTest" placeholder="如 608807420"></div>';
-	h += '<div style="align-self:flex-end"><button class="primary" onclick="testChan()">测试</button></div></div>';
-	h += '<pre id="testOut" class="mono" style="background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:10px;min-height:40px;white-space:pre-wrap;word-break:break-all;font-size:12px;margin-top:10px">等待测试…</pre></div>';
-
-	h += '</div><div class="toast" id="toast"></div><script>';
-	h += 'function esc(s){return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}';
-	h += 'function toast(m,k){var d=document.createElement("div");d.className=k||"";d.textContent=m;document.getElementById("toast").appendChild(d);setTimeout(function(){d.remove();},3200);}';
-	h += 'function api(p,b){return fetch("/admin/api/"+p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})}).then(function(r){return r.json();});}';
-	h += 'function saveCfg(){var b={userId:document.getElementById("fUser").value.trim(),token:document.getElementById("fToken").value.trim(),rateType:document.getElementById("fRate").value,enableH265:document.getElementById("fH265").checked?"1":"0",enableHDR:document.getElementById("fHDR").checked?"1":"0"};';
-	h += 'api("config/save",b).then(function(r){if(r.ok){toast("已保存","ok");}else{toast("失败："+(r.error||""),"err");}});}';
-	h += 'function testChan(){var pid=document.getElementById("fTest").value.trim();var o=document.getElementById("testOut");o.textContent="取流中…";';
-	h += 'api("test",{pid:pid}).then(function(r){o.textContent=JSON.stringify(r,null,2);});}';
-	h += '</script></body></html>';
-	return h;
-}
-
-function loginPage() {
-	let h = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">';
-	h += '<meta name="viewport" content="width=device-width,initial-scale=1">';
-	h += '<title>' + APP_NAME + ' · 登录</title><style>' + adminCss() + '</style></head><body>';
-	h += '<div class="login"><div class="card"><h1>' + APP_NAME + '</h1>';
-	h += '<p class="sub" style="color:var(--dim);font-size:13px;margin:0 0 20px">请输入管理密码</p>';
-	h += '<div class="field"><input type="password" id="pw" placeholder="管理密码"></div>';
-	h += '<button class="primary" style="width:100%" onclick="doLogin()">登录</button></div></div>';
-	h += '<script>function doLogin(){var p=document.getElementById("pw").value;fetch("/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:p})}).then(function(r){return r.json();}).then(function(j){if(j.ok){location.href="/admin";}else{alert("密码错误");}});}</script>';
-	h += '</body></html>';
-	return h;
-}
+// 说明：本服务只做流媒体后端（/health /m3u /txt /ch/<pid>），
+// 不再自带管理网页 —— 配置与管理全部在 LuCI 的「服务 → 咪咕直播」里完成，
+// 由 /usr/share/rpcd/ucode/migu 提供 ubus 接口支撑。
+// 这样同一份 UCI 配置只有一个维护入口，避免两套界面互相覆盖。
 
 // ---------- 处理器 ----------
 function handleHealth(conn) {
@@ -620,94 +475,6 @@ function handleChannel(conn, pid) {
 	redirectResponse(conn, r.url);
 }
 
-function handleAdminApi(conn, req, path, body) {
-	let j = parseJsonBody(body);
-
-	if (path === '/admin/login' && req.method === 'POST') {
-		let pw = '' + (j.password || '');
-		if (adminEnabled() && pw === cfg.adminPass) {
-			let t = newSession();
-			let head = sprintf(
-				'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\nSet-Cookie: migu_admin=%s; Path=/; HttpOnly\r\nAccess-Control-Allow-Origin: *\r\n\r\n',
-				length('{"ok":true}'), t
-			);
-			conn.sock.send(head + '{"ok":true}');
-			closeConn(conn);
-		} else {
-			jsonResponse(conn, 401, { ok: false, error: '密码错误' });
-		}
-		return;
-	}
-
-	// 其余管理接口需要会话
-	if (adminEnabled() && !validSession(req)) {
-		jsonResponse(conn, 401, { ok: false, error: '未登录' });
-		return;
-	}
-
-	if (path === '/admin/api/state' && req.method === 'POST') {
-		let groups = allChannels();
-		let total = 0;
-		for (let g in groups) total += length(g.dataList);
-		jsonResponse(conn, 200, {
-			ok: true,
-			channels: total,
-			groups: length(groups),
-			guest: cfg.isGuest,
-			rateType: cfg.rateType,
-			userId: cfg.userId !== '' ? (substr(cfg.userId, 0, 3) + '…') : '',
-			hasToken: cfg.token !== '',
-			enableH265: cfg.enableH265,
-			enableHDR: cfg.enableHDR,
-			version: APP_VERSION,
-		});
-		return;
-	}
-
-	if (path === '/admin/api/config/save' && req.method === 'POST') {
-		let ctx = uci.cursor();
-		if ('userId' in j) ctx.set('migu', 'main', 'userId', '' + (j.userId || ''));
-		if ('token' in j) ctx.set('migu', 'main', 'token', '' + (j.token || ''));
-		if ('rateType' in j) {
-			let rt = +j.rateType;
-			if (rt >= 2 && rt <= 9) ctx.set('migu', 'main', 'rateType', '' + rt);
-		}
-		if ('enableH265' in j) ctx.set('migu', 'main', 'enableH265', (j.enableH265 === '1' || j.enableH265 === true || j.enableH265 === 1) ? '1' : '0');
-		if ('enableHDR' in j) ctx.set('migu', 'main', 'enableHDR', (j.enableHDR === '1' || j.enableHDR === true || j.enableHDR === 1) ? '1' : '0');
-		let rc = ctx.commit('migu');
-		cfg = loadConfig();
-		// 清空流缓存，让新画质/账号立即生效
-		streamCache = {};
-		if (rc !== true && rc !== 0 && rc !== null) {
-			jsonResponse(conn, 500, { ok: false, error: 'uci commit 失败' });
-			return;
-		}
-		logInfo('config saved (guest=' + cfg.isGuest + ', rateType=' + cfg.rateType + ')');
-		jsonResponse(conn, 200, { ok: true });
-		return;
-	}
-
-	if (path === '/admin/api/test' && req.method === 'POST') {
-		let pid = '' + (j.pid || '');
-		if (pid === '' || match(pid, /[^0-9]/)) {
-			jsonResponse(conn, 400, { ok: false, error: '频道 ID 必须是数字' });
-			return;
-		}
-		let r = getAndroidURL(pid, cfg.rateType, cfg.userId, cfg.token, cfg.enableH265, cfg.enableHDR);
-		jsonResponse(conn, 200, {
-			ok: r.url !== '',
-			url: r.url,
-			rid: r.rid,
-			rateType: r.rateType,
-			logined: r.logined,
-			error: r.err,
-		});
-		return;
-	}
-
-	jsonResponse(conn, 404, { ok: false, error: 'no such admin endpoint' });
-}
-
 // ---------- 分发 ----------
 function dispatch(conn, head, body) {
 	let req = parseHead(head);
@@ -738,34 +505,18 @@ function dispatch(conn, head, body) {
 		return;
 	}
 
-	// /admin 管理页
+	// 老管理页地址已被 LuCI 取代，统一跳转，避免书签失效后看到 404
 	if (path === '/admin' || substr(path, 0, 6) === '/admin') {
-		if (path === '/admin' && method === 'GET') {
-			if (adminEnabled() && !validSession(req)) {
-				textResponse(conn, 200, loginPage());
-			} else {
-				textResponse(conn, 200, adminPage(req, true));
-			}
-			return;
-		}
-		if (path === '/admin/logout' && method === 'GET') {
-			let ck = req.headers['cookie'] || '';
-			let m = match(ck, /migu_admin=([^;\s]+)/);
-			if (m) { let t = m[1]; deleteSession(t); }
-			redirectResponse(conn, '/admin');
-			return;
-		}
-		if (substr(path, 0, 11) === '/admin/api/' || path === '/admin/login') {
-			handleAdminApi(conn, req, path, body);
-			return;
-		}
-		textResponse(conn, 404, '<h1>404</h1>');
+		redirectResponse(conn, '/');
 		return;
 	}
 
-	// / 根路径 → 跳管理页
+	// 根路径 → 回 LuCI 的咪咕直播页（管理入口只有 LuCI 一个）
 	if (method === 'GET' && path === '/') {
-		redirectResponse(conn, '/admin');
+		let luciHost = host;
+		let ci = index(luciHost, ':');
+		if (ci >= 0) luciHost = substr(luciHost, 0, ci);
+		redirectResponse(conn, 'http://' + luciHost + '/cgi-bin/luci/admin/services/migu');
 		return;
 	}
 

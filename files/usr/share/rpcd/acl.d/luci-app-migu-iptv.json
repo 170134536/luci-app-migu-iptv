@@ -1,11 +1,17 @@
 {
 	"luci-app-migu-iptv": {
-		"description": "Grant access to migu-iptv UCI config",
+		"description": "Grant access to Migu IPTV relay (咪咕直播) configuration, status and service control",
 		"read": {
-			"uci": [ "migu" ]
+			"uci": [ "migu" ],
+			"ubus": {
+				"migu": [ "status", "channels", "logs" ]
+			}
 		},
 		"write": {
-			"uci": [ "migu" ]
+			"uci": [ "migu" ],
+			"ubus": {
+				"migu": [ "restart", "start", "stop", "setaccount", "clearaccount" ]
+			}
 		}
 	}
 }

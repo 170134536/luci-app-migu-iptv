@@ -22,9 +22,6 @@ config migu 'main'
 	option enableH265 '1'
 	option enableHDR '1'
 
-	# 管理页密码（留空 = 管理页免登录，仅建议在可信局域网内）
-	option adminPassword ''
-
 	# 频道列表缓存时长（分钟）
 	option cacheMinutes '360'
 
