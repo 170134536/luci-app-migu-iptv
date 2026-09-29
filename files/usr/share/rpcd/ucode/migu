@@ -58,6 +58,10 @@ function loadConf() {
 		debug: false,
 		userId: '',
 		token: '',
+		publicAccess: '0',
+		publicToken: '',
+		publicBaseUrl: '',
+		publicProxyHint: '',
 	};
 
 	let ctx;
@@ -170,6 +174,12 @@ return {
 						tokenTail: '' + mask.tail,
 					},
 					baseUrl: 'http://' + (hostForUrl || '127.0.0.1') + ':' + conf.port,
+					// 公网访问相关（令牌只回显长度，不回显明文）
+					publicAccess: ('' + conf.publicAccess) === '1',
+					publicTokenSet: length('' + conf.publicToken) > 0,
+					publicTokenLength: length('' + conf.publicToken),
+					publicBaseUrl: '' + (conf.publicBaseUrl || ''),
+					publicProxyHint: '' + (conf.publicProxyHint || ''),
 				};
 			}
 		},
@@ -317,6 +327,26 @@ return {
 					return { ok: false, error: '保存失败' };
 				run('/etc/init.d/migu restart 2>/dev/null');
 				return { ok: true };
+			}
+		},
+
+		// 生成一个随机公网访问令牌（32 位十六进制）
+		//
+		// 只生成并返回，不写盘 —— 由用户点「保存 & 应用」时随表单一起提交，
+		// 避免在这里直接改 UCI 造成和设置页表单状态不一致。
+		gentoken: {
+			call: function() {
+				let raw = run('head -c 16 /dev/urandom | od -An -tx1 | tr -d " \\n" 2>/dev/null');
+				let tok = trim('' + (raw || ''));
+				if (length(tok) !== 32) {
+					// 退化方案：用两次时间戳 + pid 拼一个够长的串
+					let p1 = run('date +%s%N 2>/dev/null');
+					let p2 = run('cat /proc/sys/kernel/random/uuid 2>/dev/null');
+					tok = replace(replace(trim('' + (p1 || '')) + trim('' + (p2 || '')), '-', ''), '\n', '');
+					tok = substr(tok, 0, 32);
+				}
+				if (length(tok) < 8) return { ok: false, error: '无法生成令牌' };
+				return { ok: true, token: tok };
 			}
 		},
 

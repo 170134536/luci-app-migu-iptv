@@ -121,11 +121,31 @@ return view.extend({
 			accountNode = badge(_('游客模式（最高 540p）'), 'warn');
 		}
 
+		/* ---------------- 公网访问状态 ---------------- */
+		var pubNode;
+		if (status.publicAccess) {
+			var parts = [ badge(_('公网访问已开启'), 'warn') ];
+			if (status.publicTokenSet) {
+				parts.push(' ', badge(_('令牌校验（') + (status.publicTokenLength || '?') + _(' 位）'), 'ok'));
+			} else {
+				parts.push(' ', badge(_('未设令牌（公网可无密码访问）'), 'err'));
+			}
+			pubNode = E('span', {}, parts);
+		} else {
+			pubNode = E('span', {}, [
+				badge(_('关闭'), 'ok'),
+				E('span', { 'style': 'opacity:.6;font-size:12px;margin-left:8px;' },
+					[ _('仅局域网可访问') ])
+			]);
+		}
+
 		var overview = E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, [ _('服务状态') ]),
 			E('div', { 'style': 'padding:4px 0;' }, [ runningBadge, ' ', reachBadge, ' ', enabledBadge ]),
 			E('div', { 'style': 'margin-top:10px;' }, [
 				row(_('监听地址'), mono((status.host || '0.0.0.0') + ':' + port)),
+				row(_('公网访问'), pubNode,
+					status.publicAccess && status.publicBaseUrl ? mono(status.publicBaseUrl) : ''),
 				row(_('当前画质'), mono(RATE_NAMES['' + (status.liveRateType || status.rateType || 3)] || '-'),
 					status.guest ? _('游客降级') : ''),
 				row(_('咪咕账号'), accountNode),
@@ -200,6 +220,53 @@ return view.extend({
 				_('频道在播放时才实时取流，流地址短期有效、自动续期；播放器切台或重连会重新取新地址。')
 			])
 		]);
+
+		/* ---------------- 公网订阅地址（开启公网时才显示）---------------- */
+		var pubSubscribe = [];
+		if (status.publicAccess) {
+			// 自定义地址优先；没填就用占位提示（具体公网地址只有用户自己知道）
+			var pubBase = status.publicBaseUrl ||
+				('http://你的公网地址或域名:' + port);
+			var tokSeg = status.publicTokenSet ? '/<令牌>' : '';
+
+			// 描述行：对外地址 + 令牌状态提示（拆开构建，避免三元逗号语法坑）
+			var desc = [];
+			if (status.publicBaseUrl) {
+				desc.push(_('对外地址：'));
+				desc.push(mono(status.publicBaseUrl));
+				desc.push('；');
+			}
+			if (status.publicTokenSet) {
+				desc.push(_('已启用令牌校验，下面地址里的 '));
+				desc.push(mono('<令牌>'));
+				desc.push(_(' 替换成你在设置页看到的令牌即可。'));
+			} else {
+				desc.push(badge(_('未设令牌'), 'warn'));
+				desc.push(_(' —— 任何人拿到地址都能访问，建议在设置页开启。'));
+			}
+
+			pubSubscribe = [
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, [ _('公网订阅地址') ]),
+					E('p', { 'style': 'opacity:.8;margin:6px 0 12px;' }, desc),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ _('M3U（公网）') ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							copyField(pubBase + tokSeg + '/m3u')
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ _('TXT（公网）') ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							copyField(pubBase + tokSeg + '/txt')
+						])
+					]),
+					E('p', { 'style': 'opacity:.7;font-size:12px;margin-top:10px;' }, [
+						_('前提是路由器已做端口映射（防火墙 → 端口转发），且「监听地址」为所有网络接口。')
+					])
+				])
+			];
+		}
 
 		/* ---------------- 频道测试 ---------------- */
 		var list = (chans && chans.list) ? chans.list : [];
@@ -342,17 +409,21 @@ return view.extend({
 			logBox
 		]);
 
+		// 注意（实测）：LuCI 的 dom.append 不展平嵌套数组——children 里的数组元素
+		// 会被 toString() 变成文本节点 "[object Object]"。所以这里必须用 concat
+		// 把 pubSubscribe 拍平进 children，不能直接嵌数组。
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', { 'name': 'content' }, [ _('咪咕直播') ]),
 			E('div', { 'class': 'cbi-map-descr' },
 				[ _('咪咕视频直播频道 → TV-BOX 可订阅的 M3U 播放列表。配置项请到「设置」页。') ]),
 			overview,
 			control,
-			subscribe,
+			subscribe
+		].concat(pubSubscribe, [
 			test,
 			groupsSection,
 			logSection
-		]);
+		]));
 	},
 
 	handleSave: null,
