@@ -291,6 +291,9 @@ luci-app-migu-iptv/
 ├── Makefile
 ├── README.md
 ├── LICENSE
+├── tools/                                     # 运维/验证/探测脚本存档（不参与安装）
+│   ├── README.md
+│   ├── deploy/  verify/  probe/  audit/  loadtest/
 └── files/
     ├── etc/
     │   ├── config/migu                        # UCI 配置模板
@@ -313,3 +316,6 @@ luci-app-migu-iptv/
 - 服务端口（默认 8788）默认监听 `0.0.0.0`，同网段内任何人都能取流；如需限制改
   「设置 → 监听地址」或配合防火墙。
 - 蓝光 / 原画 / 4K 以及体育会员频道需要**付费 VIP**，本项目只负责「转发你已有权限的流」，不绕过、不破解咪咕的会员校验。
+- `tools/` 下的运维脚本已做脱敏（路由器口令、公网令牌、WAN 地址全部替换为
+  `$env:ROUTER_PASS` / `${PUBLIC_TOKEN}` / `${WAN_IP}` 等占位形式，并带正向对照的残留扫描，
+  详见 [tools/README.md](tools/README.md)）。使用时请通过环境变量注入自己的凭据，**不要**把真实值提交回仓库。
