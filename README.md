@@ -19,7 +19,7 @@
 
 | 页面 | 路径 | 作用 |
 | --- | --- | --- |
-| **设置** | 服务 → 咪咕直播 → 设置 | 服务开关、监听端口/地址、画质档位、H.265/HDR、缓存、取流/失败缓存 TTL、并发上限、EPG 来源与刷新、调试日志、咪咕账号（userId + token，密码框输入） |
+| **设置** | 服务 → 咪咕直播 → 设置 | 服务开关、监听端口/地址、画质档位、H.265/HDR、缓存、取流/失败缓存 TTL、并发上限、EPG 来源与刷新、调试日志、咪咕账号（userId + token，密码框输入）、外部源探测 User-Agent |
 | **运行状态** | 服务 → 咪咕直播 → 运行状态 | 运行状态徽章、服务控制（启动/停止/重启）、TV-BOX 订阅地址（可点选复制）、频道测试、频道分组统计、服务日志 |
 
 **「保存 & 应用」会写 UCI 并自动重启服务**，无需手动去「系统 → 启动项」重启。
@@ -58,14 +58,14 @@ TV-BOX 里订阅地址就是 `http://路由器IP:8788/m3u`。
 ```sh
 cp -r luci-app-migu-iptv package/
 make package/luci-app-migu-iptv/compile V=s
-# 产物：bin/packages/.../luci-app-migu-iptv_1.4.1-1_all.ipk
+# 产物：bin/packages/.../luci-app-migu-iptv_1.5.0-1_all.ipk
 ```
 
 路由器上安装：
 
 ```sh
-apk add --allow-untrusted luci-app-migu-iptv_1.4.1-1_all.ipk
-# 老版本 OpenWrt 用：opkg install luci-app-migu-iptv_1.4.1-1_all.ipk
+apk add --allow-untrusted luci-app-migu-iptv_1.5.0-1_all.ipk
+# 老版本 OpenWrt 用：opkg install luci-app-migu-iptv_1.5.0-1_all.ipk
 ```
 
 ### 方式 B：手动部署
@@ -130,12 +130,18 @@ apk add ucode ucode-mod-fs ucode-mod-uloop ucode-mod-socket ucode-mod-uci ucode-
 
 | 选项 | 默认 | 说明 |
 | --- | --- | --- |
-| `streamTtl` | `300` | 取流地址缓存秒数（`0` = 不缓存，上限 3600）。实测咪咕下发的地址复用性很好，缓久一点能显著减少切台耗时 |
+| `streamTtl` | `1800` | 取流地址缓存秒数（`0` = 不缓存，上限 10800 = 3 小时）。实测咪咕签发的地址有效期约 3 小时，缓久一点能显著减少切台耗时 |
 | `failTtl` | `15` | **失败**结果的缓存秒数（`0` = 不缓存，上限 300）。版权盾时段失败是间歇性的，缓太久会把临时失败放大成一直失败；完全不缓存又会让连点重试每次都等一轮完整解析 |
 | `maxConns` | `64` | 最大并发连接数（4~4096）。超出直接拒绝，防止单客户端刷请求占满单线程事件循环 |
 | `epgUrl` | `https://live.fanmingming.cn/e.xml` | EPG 来源，用于把频道名映射成标准 `tvg-id`。**留空不能关闭 EPG**：UCI 存不下空字符串，清空后会回落到内置默认源 |
 | `epgRefreshHours` | `12` | EPG 刷新间隔（0~168 小时）。**设为 `0` 才是关闭 EPG**（此时 `tvg-id` 退回频道名、节目单为空）。拉取失败会自动改为 5 分钟后重试 |
 | `warmRecent` | `4` | 启动时预热「最近看过」的频道数（0~12）。开机后首次点开可秒开 |
+
+### 1.5.0 新增选项
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `extUserAgent` | 空 | 外部源健康检查与分片探测时发送的 User-Agent（空 = curl 默认）。部分防盗链源只认播放器 UA（如 `VLC/3.0.18 LibVLC/3.0.18`），对 curl 默认 UA 返回 403/451 会被误判为失效 |
 
 超出账号权益时会自动降级到咪咕愿意给的档位（例如游客要 4K 会一路降到 540p）。
 
@@ -178,9 +184,9 @@ apk add ucode ucode-mod-fs ucode-mod-uloop ucode-mod-socket ucode-mod-uci ucode-
 `/health` 会返回完整运行指标，便于排查：
 
 ```json
-{ "version": "1.4.1", "channels": 174, "chRequests": 2, "chCacheHits": 1,
+{ "version": "1.5.0", "channels": 174, "chRequests": 2, "chCacheHits": 1,
   "chHitRatePct": 50, "avgResolveMs": 590, "chFallback": 1,
-  "activeConns": 1, "maxConns": 64, "streamTtl": 300, "failTtl": 15,
+  "activeConns": 1, "maxConns": 64, "streamTtl": 1800, "failTtl": 15,
   "epgIds": 124, "epgOk": true, "denied": 0, "rejectedByLimit": 0 }
 ```
 
@@ -210,6 +216,16 @@ apk add ucode ucode-mod-fs ucode-mod-uloop ucode-mod-socket ucode-mod-uci ucode-
 读循环一律限次（16 轮），避免单线程事件循环被持续灌数据卡住。修复后复测
 `rejectedByLimit` 恰好等于 120（60+60 次探测全部真正走到拒绝分支），确认测的是
 目标路径而非被绕过。
+
+### 1.5.0 深度优化（参考 8 个开源 IPTV 项目后的改造）
+
+| 改动 | 说明 | 参考项目 |
+| --- | --- | --- |
+| `streamTtl` 默认 300 → 1800 | 咪咕签发的流地址实测有效期约 3 小时，缓存 30 分钟显著减少切台耗时 | akiralereal/iptv |
+| 外部源健康检查升级**两段式** | ① 拉 m3u8 头校验 `#EXTM3U`；② 解析首个分片，Range 请求前 32 字节校验 `0x47`（TS 同步字节）或 fMP4 box 头。只校验播放列表会把「返回 200 但分片全挂」的假阳性源判成可用 | awesome-iptv / IPTV Stream Checker |
+| **慢源临时禁用** | 外部源连续失败 3 次后临时禁用 10 分钟，期满自动重新探测。避免每次降级都被同一个慢源拖累 | lizongying/my-tv |
+| `extUserAgent` 可配置 | 防盗链源只认播放器 UA（如 `VLC/3.0.18 LibVLC/3.0.18`），对 curl 默认 UA 返回 403/451 会被误判失效 | awesome-iptv |
+| EPG **条件更新** | 拉取带 `If-None-Match`（ETag，实测该源无 Last-Modified），源未变（304）时跳过 7.9MB 的下载与解析，沿用已有 id 表并正常续期 | awesome-iptv |
 
 ---
 

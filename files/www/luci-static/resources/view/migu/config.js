@@ -133,10 +133,10 @@ return view.extend({
 			_('不确定就保持默认。');
 
 		o = s.option(form.Value, 'streamTtl', _('取流地址缓存（秒）'),
-			_('成功解析出的流地址缓存多久。实测咪咕下发的地址复用性很好，') +
+			_('成功解析出的流地址缓存多久。实测咪咕签发的地址有效期约 3 小时，') +
 			_('缓存期内切回同一频道是毫秒级响应。设为 0 表示不缓存。'));
-		o.datatype = 'range(0,3600)';
-		o.default = '300';
+		o.datatype = 'range(0,10800)';
+		o.default = '1800';
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'failTtl', _('失败结果缓存（秒）'),
@@ -252,6 +252,13 @@ return view.extend({
 			}
 			return true;
 		};
+
+		o = s.option(form.Value, 'extUserAgent', _('探测 User-Agent（可选）'),
+			_('外部源健康检查与分片探测时发送的 User-Agent。') +
+			_('部分防盗链源只认播放器 UA（如 "VLC/3.0.18 LibVLC/3.0.18"），') +
+			_('对 curl 默认 UA 返回 403/451，会被误判为失效。留空 = 用 curl 默认。'));
+		o.placeholder = 'VLC/3.0.18 LibVLC/3.0.18';
+		o.rmempty = true;
 
 		/* ---------------- 公网访问 ---------------- */
 		s = m.section(form.NamedSection, 'main', 'migu', _('公网访问'));

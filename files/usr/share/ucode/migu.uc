@@ -139,6 +139,28 @@
 //        `socket.MSG_DONTWAIT = 64`、`socket.SHUT_WR = 1`、`socket.SO_LINGER = 13`
 //      注意：`import { socket } from 'socket'` 会报 `Module does not export socket`，
 //      必须写 `import * as socket from 'socket'`。
+//
+// ---- 1.5.0 深度优化（研读 8 个开源 IPTV 项目后提炼，均有实测依据）----
+//  19. 取流成功缓存默认 300 → 1800 秒（上限放宽到 10800 秒）。
+//      依据：akiralereal/iptv 的咪咕模块实测上游签名地址约 3 小时有效；
+//      我们的实测里缓存命中 1.7ms vs 未命中 480~780ms，把缓存放宽到 30 分钟
+//      能大幅减少重复打咪咕接口，又不至于让过期地址进入播放器。
+//  20. 外部备用源健康检查升级为「两段式」（借鉴 awesome-iptv / IPTVChecker）：
+//      第一段拉 m3u8 播放列表头，校验 HTTP 2xx/3xx 且内容含 #EXTM3U；
+//      第二段解析出首个分片（master 列表则先递归到子列表），请求其前 32 字节，
+//      校验首字节为 TS 同步字节 0x47 或 fMP4 box 头（ftyp/styp/moov）。
+//      旧写法只校验播放列表头，会把「列表能下但分片全挂」的假阳性源判成可用。
+//  21. 慢源临时禁用（借鉴 my-tv）：同一外部源连续失败 3 次后临时禁用 10 分钟，
+//      避免每次降级都被同一个慢源拖累；禁用期满自动清零重新探测。
+//  22. 外部源检查可配 User-Agent（新配置项 extUserAgent，默认空 = curl 默认）。
+//      部分防盗链源只认播放器 UA（如 "VLC/3.0.18 LibVLC/3.0.18"），对 curl
+//      默认 UA 返回 403/451；配置后仅影响外部源检查与分片探测，不影响取流。
+//  23. EPG 条件更新：保存上次响应的 ETag，下次拉取带 If-None-Match。
+//      实测源（live.fanmingming.cn/e.xml）无 Last-Modified 头，只有 ETag，
+//      所以用 ETag。源未变化（HTTP 304）时直接沿用现有 id 表，
+//      不再每次下载 7.9MB 的 e.xml 再全量解析（借鉴 awesome-iptv）。
+//      注意：条件请求只在内存已有 id 表时发送——进程刚重启时 RAM 里
+//      没有 id 表，304 会让我们拿不到数据，所以首轮必须全量下载。
 // ============================================================
 
 'use strict';
@@ -158,7 +180,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 const APP_NAME = '咪咕直播';
-const APP_VERSION = '1.4.1';
+const APP_VERSION = '1.5.0';
 const DEFAULT_PORT = 8788;
 
 // 分组显示顺序：按正常电视台习惯，央视（CCTV1 开头）排最前，其余靠后。
@@ -187,6 +209,9 @@ let streamCache = {};      // pid -> { url, at } 取流结果短缓存
 // 外部源可用性缓存：url -> { ok, at }
 // ok=true 缓存 300 秒（源可用，复用结果）；ok=false 缓存 60 秒（避免反复打失效源）
 let extSourceCache = {};
+// 外部源连续失败计数与临时禁用状态（慢源临时禁用，见 checkExternalSource）
+let extFailCount = {};   // url -> 连续失败次数
+let extDisabled = {};    // url -> 禁用开始时间
 
 // 运行统计（/health 暴露，用于观察优化效果）
 let stats = {
@@ -290,9 +315,10 @@ function loadConfig() {
 		// ---- 1.3.0 新增 ----
 		// 取流地址缓存秒数。旧版硬编码 60 秒；实测命中缓存 1.7ms、未命中
 		// 480~780ms（版权频道走回落链 1000~1220ms），换台快慢几乎只取决于
-		// 缓存冷不冷。咪咕签发的地址本身有效期远长于 60 秒，所以放宽到 300。
-		// 设 0 表示不缓存（每次请求都重新解析，仅调试用）。
-		streamTtl: '300',
+		// 缓存冷不冷。咪咕签发的地址本身有效期约 3 小时（akiralereal/iptv
+		// 实测结论，我们 1.5.0 起据此放宽默认值）。设 0 表示不缓存
+		// （每次请求都重新解析，仅调试用）。
+		streamTtl: '1800',
 		// 失败结果短缓存秒数。旧版失败完全不缓存（每次连点都重新打咪咕接口，
 		// 实测无效频道要 1.4 秒）。这里给一个很短的缓存兜住连点，又不会把
 		// 间歇性的版权盾固化成假故障。设 0 = 关闭（回到旧行为）。
@@ -307,6 +333,10 @@ function loadConfig() {
 		epgRefreshHours: '12',
 		// 后台预热最近看过的频道数（0 = 关闭）。
 		warmRecent: '4',
+		// 外部源健康检查用的 User-Agent（空 = curl 默认）。部分防盗链源只认
+		// 播放器 UA（如 "VLC/3.0.18 LibVLC/3.0.18"），对 curl 默认 UA 返回
+		// 403/451；填上播放器 UA 可提高兼容性。仅影响外部源检查与分片探测。
+		extUserAgent: '',
 	};
 
 	let ctx = uci.cursor();
@@ -346,8 +376,8 @@ function loadConfig() {
 
 	// ---- 1.3.0 新增项的归一化 ----
 	c.streamTtl = +c.streamTtl;
-	if (!(c.streamTtl >= 0)) c.streamTtl = 300;          // NaN/负数 → 默认
-	if (c.streamTtl > 3600) c.streamTtl = 3600;          // 上限 1 小时
+	if (!(c.streamTtl >= 0)) c.streamTtl = 1800;         // NaN/负数 → 默认 30 分钟
+	if (c.streamTtl > 10800) c.streamTtl = 10800;      // 上限 3 小时（上游签名有效期约 3h）
 	c.failTtl = +c.failTtl;
 	if (!(c.failTtl >= 0)) c.failTtl = 15;
 	if (c.failTtl > 300) c.failTtl = 300;
@@ -363,6 +393,8 @@ function loadConfig() {
 	c.warmRecent = +c.warmRecent;
 	if (!(c.warmRecent >= 0)) c.warmRecent = 4;
 	if (c.warmRecent > RECENT_MAX) c.warmRecent = RECENT_MAX;
+	// ---- 1.5.0 新增 ----
+	c.extUserAgent = trim('' + (c.extUserAgent || ''));
 
 	return c;
 }
@@ -717,15 +749,90 @@ function warmRecentChannels() {
 // 依次尝试外部源。外部源是静态 HLS URL，不走咪咕鉴权流程，直接返回给播放器。
 //
 // 检查结果带缓存，避免每次请求都去打失效源浪费带宽。
-const EXT_OK_TTL = 300;     // 成功缓存 5 分钟
-const EXT_FAIL_TTL = 60;    // 失败缓存 1 分钟
+const EXT_OK_TTL = 300;        // 成功缓存 5 分钟
+const EXT_FAIL_TTL = 60;       // 失败缓存 1 分钟
+// 慢源临时禁用（1.5.0，借鉴 my-tv）：连续失败达到阈值后，短时间内直接判失败，
+// 不再让每次降级都被同一个慢源拖累。禁用期满自动清零计数重新探测。
+const EXT_FAIL_THRESHOLD = 3;   // 连续失败次数阈值
+const EXT_DISABLE_TTL = 600;   // 禁用时长：10 分钟
+
+// 拉取 HLS 播放列表头部（前 400 字节），返回响应体（不含状态码）或 null。
+// HTTP 状态不在 200-399 或内容不以 #EXTM3U 开头都算失败，返回 null。
+function fetchHlsHead(url) {
+	let uaArg = cfg.extUserAgent ? ' -A ' + shquote(cfg.extUserAgent) : '';
+	let cmd = 'curl -s -L -m 10 -r 0-400' + uaArg + " -w '\\n__CODE__%{http_code}' " + shquote(url);
+	let body = sh(cmd) || '';
+	let mi = rindex(body, '__CODE__');
+	if (mi < 0) return null;
+	let code = trim(substr(body, mi + 8));
+	body = substr(body, 0, mi);
+	if (!(code >= 200 && code < 400)) return null;
+	if (index(body, '#EXTM3U') < 0) return null;
+	return body;
+}
+
+// 把 HLS 播放列表里的相对 URL 解析成绝对 URL（基于播放列表自身 URL）。
+function resolveHlsUrl(u, base) {
+	if (substr(u, 0, 7) === 'http://' || substr(u, 0, 8) === 'https://') return u;
+	let slash = rindex(base, '/');
+	if (slash < 0) return u;
+	return substr(base, 0, slash + 1) + u;
+}
+
+// 从 m3u8 播放列表文本中提取首个媒体分片 URL（相对路径按 base 解析）。
+// 支持两种形态：
+//   媒体播放列表：`#EXTINF:...` 后的下一行是分片 URL；
+//   master 播放列表：`#EXT-X-STREAM-INF...` 后的下一行是 variant URL，
+//     则递归一层取其首个分片（最多两层，避免探测过深）。
+// 找不到返回 null。
+function hlsFirstSegment(body, base, depth) {
+	let lines = split(body, '\n');
+	let firstUri = '';
+	for (let ln in lines) {
+		ln = trim(ln);
+		if (ln === '' || substr(ln, 0, 1) === '#') continue;
+		firstUri = ln;
+		break;
+	}
+	if (firstUri === '') return null;
+	let seg = resolveHlsUrl(firstUri, base);
+	// 取到的是 variant（子播放列表）→ 递归一层找分片
+	if ((index(firstUri, '.m3u8') >= 0 || index(firstUri, '.m3u') >= 0) && depth < 2) {
+		let sub = fetchHlsHead(seg);
+		if (sub === null) return null;
+		return hlsFirstSegment(sub, seg, depth + 1);
+	}
+	return seg;
+}
+
+// 请求分片前 32 字节，校验首字节为 TS 同步字节 0x47（MPEG-TS），
+// 或为 fMP4 box 头（ftyp/styp/moov，HLS fMP4 分段）。都校验不到则判不可用。
+function checkSegment(seg) {
+	let uaArg = cfg.extUserAgent ? ' -A ' + shquote(cfg.extUserAgent) : '';
+	let cmd = 'curl -s -L -m 8 -r 0-31' + uaArg + " -w '\\n__CODE__%{http_code}' " + shquote(seg);
+	let body = sh(cmd) || '';
+	let mi = rindex(body, '__CODE__');
+	if (mi < 0) return false;
+	let code = trim(substr(body, mi + 8));
+	let data = substr(body, 0, mi);
+	if (!(code >= 200 && code < 400)) return false;
+	if (length(data) === 0) return false;
+	// 二进制分片可能带 0x00 前导；检查开头 4 字节的特征
+	let head = substr(data, 0, 4);
+	if (substr(head, 0, 1) === '\x47') return true;   // MPEG-TS 同步字节
+	if (head === 'ftyp' || head === 'styp' || head === 'moov') return true; // fMP4 box 头
+	return false;
+}
 
 // 检查外部源 URL 是否可达且内容有效。返回 true/false。
 //
-// 必须同时校验「HTTP 状态」和「响应体含 #EXTM3U」：
-// 大量失效 IPTV 源会返回 HTTP 200 + 纯文本错误页（如 "the channel is not exist"），
-// 只看状态码会把假源判成可用，导致降级链把用户带到打不开的地址。
-// 用 -L 跟随重定向（很多公开源是 302 到真实 HLS），10 秒超时，只取前面一小段。
+// 1.5.0 起为两段式（awesome-iptv 最佳实践）：
+//   第一段：拉取 m3u8 播放列表头，校验 HTTP 2xx/3xx 且内容含 #EXTM3U；
+//   第二段：解析出首个分片并请求其前 32 字节，校验 0x47 / fMP4 box。
+// 只校验播放列表头会把「列表能下但分片全挂」的假阳性源判成可用，
+// 导致降级链把用户带到打不开的地址（大量失效 IPTV 源会返回
+// HTTP 200 + 纯文本错误页，如 "the channel is not exist"）。
+// 用 -L 跟随重定向（很多公开源是 302 到真实 HLS），10 秒超时。
 function checkExternalSource(url) {
 	let now = time();
 	let hit = extSourceCache[url];
@@ -734,20 +841,36 @@ function checkExternalSource(url) {
 		if ((now - hit.at) < ttl) return hit.ok;
 	}
 
-	let cmd = "curl -s -L -m 10 -r 0-400 -w '\\n__CODE__%{http_code}' " + shquote(url);
-	let body = sh(cmd) || '';
-	// 从尾部切出状态码，剩下的部分做内容判定
+	// 慢源临时禁用：禁用期内直接判失败，不再发起探测。
+	let dis = extDisabled[url];
+	if (dis && (now - dis) < EXT_DISABLE_TTL) return false;
+	if (dis) {
+		// 禁用期满：清零计数，放行重新探测
+		extFailCount[url] = 0;
+		delete extDisabled[url];
+	}
+
 	let ok = false;
-	let code = '';
-	let mi = rindex(body, '__CODE__');
-	if (mi >= 0) {
-		code = trim(substr(body, mi + 8));
-		body = substr(body, 0, mi);
-		ok = (code >= 200 && code < 400) && (index(body, '#EXTM3U') >= 0);
+	let body = fetchHlsHead(url);
+	if (body !== null) {
+		let seg = hlsFirstSegment(body, url, 0);
+		if (seg) ok = checkSegment(seg);
 	}
 
 	extSourceCache[url] = { ok: ok, at: now };
-	if (!ok) logInfo('外部源不可用: ' + url + ' (HTTP ' + code + '，' + (length(body) === 0 ? '无响应' : '内容非 HLS') + ')');
+	if (!ok) {
+		let fc = (extFailCount[url] || 0) + 1;
+		extFailCount[url] = fc;
+		if (fc >= EXT_FAIL_THRESHOLD) {
+			extDisabled[url] = now;
+			logInfo('外部源连续失败 ' + fc + ' 次，临时禁用 10 分钟: ' + url);
+		} else {
+			logInfo('外部源不可用: ' + url + (body === null ? '（播放列表无效）' : '（分片校验失败）'));
+		}
+	} else {
+		extFailCount[url] = 0;
+		delete extDisabled[url];
+	}
 	return ok;
 }
 
@@ -1041,7 +1164,8 @@ function externalBase(host, access) {
 //    （0.00s），事件循环心跳照常跳动，所以这里改成「后台写文件 + 轮询取结果」。
 const EPG_TMP = '/tmp/.migu-epg.xml';     // 原始 XML（临时）
 const EPG_IDS = '/tmp/.migu-epg.ids';     // 解析出的 id 表（临时）
-const EPG_DONE = '/tmp/.migu-epg.done';   // 完成标记，内容为 OK / FAIL
+const EPG_DONE = '/tmp/.migu-epg.done';   // 完成标记，内容为 OK / FAIL / UNCHANGED
+const EPG_LM = '/tmp/.migu-epg.lm';       // 上次响应的 ETag（持久，用于 304 条件请求）
 let epgPending = false;                   // 是否有后台拉取正在进行
 let epgStartedAt = 0;                     // 本次拉取开始时间（用于超时兜底）
 // 本轮拉取的「代」号。文件名带代际后缀，避免超时兜底放弃后又起一轮时，
@@ -1074,17 +1198,35 @@ function epgStartFetch() {
 	// 7.9MB 的 XML 压缩后传输更快，正好压低失败窗口。
 	// 最坏耗时 = 3 轮 × (5 次尝试 × 25s + 4×2s 退避) ≈ 400s，所以下面的
 	// 超时兜底取 600s，宁可慢也不让两轮任务交错。
+	// 1.5.0 起带 If-None-Match 条件请求（ETag）：源未变（304）时直接标记
+	// UNCHANGED，不再下载/解析 7.9MB 的 e.xml（借鉴 awesome-iptv 的 EPG 条件更新）。
+	// 实测该源（Cloudflare）只有 ETag、没有 Last-Modified，所以用 ETag。
+	let hdr = xml + '.hdr';            // 响应头（含 ETag）
+	let codef = xml + '.code';         // HTTP 状态码文件
+	let etag = trim(sh('cat ' + EPG_LM + ' 2>/dev/null'));
+	// 只有内存里已有 id 表时才带条件请求：进程刚重启时 epgState.ids 在 RAM 里
+	// 为空，304 只会让我们什么都得不到（实测「EPG 返回 304 但没有可用 id 表」）。
+	// 所以首轮必须全量下载，条件请求只用于 12 小时周期刷新。
+	let haveIds = epgState.ids && length(epgState.ids) > 0;
+	let cond = (haveIds && etag) ? " -H 'If-None-Match: " + etag + "'" : '';
 	let job = '( i=0; while [ $i -lt 3 ]; do ' +
+		'rm -f ' + codef + ' ' + hdr + '; ' +
 		'curl -s -L --compressed --connect-timeout 8 -m 25 ' +
-		'--retry 4 --retry-delay 2 --retry-all-errors ' +
-		'-o ' + xml + ' ' + url + '; ' +
+		'--retry 4 --retry-delay 2 --retry-all-errors' + cond + ' ' +
+		'-D ' + hdr + ' -w "%{http_code}" -o ' + xml + ' ' + url + ' > ' + codef + '; ' +
+		'CODE=$(cat ' + codef + ' 2>/dev/null); ' +
+		'if [ "$CODE" = "304" ]; then echo UNCHANGED > ' + done + '; break; fi; ' +
 		'if [ -s ' + xml + ' ] && tail -c 200 ' + xml + ' | grep -q "</tv>"; then break; fi; ' +
 		'rm -f ' + xml + '; i=$((i+1)); sleep 2; done; ' +
-		'if [ -s ' + xml + ' ] && tail -c 200 ' + xml + ' | grep -q "</tv>"; then ' +
+		'if [ "$CODE" = "304" ]; then ' +
+		'rm -f ' + xml + ' ' + codef + ' ' + hdr + '; ' +
+		'elif [ -s ' + xml + ' ] && tail -c 200 ' + xml + ' | grep -q "</tv>"; then ' +
+		'ETAG=$(grep -i "^etag:" ' + hdr + ' | tail -n 1 | sed "s/^[Ee]tag:[[:space:]]*//" | tr -d "\\r"); ' +
+		'[ -n "$ETAG" ] && echo "$ETAG" > ' + EPG_LM + '; ' +
 		'sed -n \'s/.*<channel[^>]*id="\\([^"]*\\)".*/\\1/p\' ' + xml +
 		' | sort -u > ' + ids + '; echo OK > ' + done + '; ' +
 		'else : > ' + ids + '; echo FAIL > ' + done + '; fi; ' +
-		'rm -f ' + xml + ' ) >/dev/null 2>&1 &';
+		'rm -f ' + xml + ' ' + codef + ' ' + hdr + ' ) >/dev/null 2>&1 &';
 	sh(job);
 	if (cfg.debug) logInfo('EPG 后台拉取已启动（代 ' + g + '）');
 }
@@ -1106,6 +1248,24 @@ function epgPollFetch() {
 	let done = trim(sh('cat ' + epgCurDone + ' 2>/dev/null'));
 	if (done === '') return 'pending';      // 还没写完
 	epgPending = false;
+
+	// 1.5.0：304 未变更。沿用现有 id 表，只刷新「最后成功时间」，
+	// 这样定时器按正常周期调度下一轮，不会把 UNCHANGED 误判成失败
+	// （失败路径会短时间重试；源没变不需要重试）。
+	if (done === 'UNCHANGED') {
+		sh('rm -f ' + epgCurIds + ' ' + epgCurDone + ' 2>/dev/null');
+		if (epgState.ids && length(epgState.ids) > 0) {
+			epgState.at = time();
+			epgState.ok = true;
+			logInfo('EPG 未变更（304），沿用 ' + length(epgState.ids) + ' 个频道 id');
+			return 'ok';
+		}
+		// 上次没有 id（首次拉取就 304 不可能发生，但防御性处理）→ 按失败处理
+		logErr('EPG 返回 304 但没有可用 id 表');
+		epgState.at = time();
+		epgState.ok = false;
+		return 'fail';
+	}
 
 	let out = sh('cat ' + epgCurIds + ' 2>/dev/null');
 	sh('rm -f ' + epgCurIds + ' ' + epgCurDone + ' 2>/dev/null');
