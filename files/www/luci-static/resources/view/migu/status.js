@@ -15,6 +15,11 @@ var callChannels = rpc.declare({ object: 'migu', method: 'channels', expect: { }
 var callRestart = rpc.declare({ object: 'migu', method: 'restart', expect: { } });
 var callStart = rpc.declare({ object: 'migu', method: 'start', expect: { } });
 var callStop = rpc.declare({ object: 'migu', method: 'stop', expect: { } });
+// 注意（实测）：ubus 的参数类型校验很严，后端把 lines 声明为 String，
+// 传数字 40 会被 rpcd 直接拒掉（`Invalid argument`，请求根本进不到方法体）。
+// 所以这里必须传字符串 '40'，不能传数字。
+var LOG_LINES = '40';
+
 var callTest = rpc.declare({
 	object: 'migu', method: 'testchannel', params: [ 'pid' ], expect: { }
 });
@@ -81,7 +86,7 @@ return view.extend({
 		return Promise.all([
 			callStatus(),
 			callChannels(),
-			callLogs(40)
+			callLogs(LOG_LINES)
 		]);
 	},
 
@@ -152,6 +157,89 @@ return view.extend({
 				row(_('频道数量'), mono((status.channels || 0) + ' 个 / ' + (status.groups || 0) + ' 组'),
 					status.cacheAge ? _('缓存') + ' ' + Math.round(status.cacheAge / 60) + ' ' + _('分钟') : ''),
 				row(_('版本'), mono(status.version || '-'))
+			])
+		]);
+
+		/* ---------------- 节目单（EPG） ---------------- */
+		var epgNode;
+		if (!status.reachable) {
+			epgNode = E('span', { 'style': 'opacity:.6;' }, [ _('服务未运行，无法查询') ]);
+		} else if (!status.epgEnabled) {
+			epgNode = E('span', {}, [
+				badge(_('已关闭'), 'dim'),
+				E('span', { 'style': 'opacity:.6;font-size:12px;margin-left:8px;' },
+					[ _('tvg-id 将退回频道名，电视盒节目单为空') ])
+			]);
+		} else if (status.epgOk && status.epgIds > 0) {
+			epgNode = E('span', {}, [
+				badge(_('已就绪'), 'ok'),
+				' ',
+				mono(status.epgIds + ' ' + _('个频道 id')),
+				E('span', { 'style': 'opacity:.6;font-size:12px;margin-left:8px;' },
+					[ _('更新于') + ' ' + Math.round((status.epgAge || 0) / 60) + ' ' + _('分钟前') ])
+			]);
+		} else {
+			epgNode = E('span', {}, [
+				badge(_('未就绪'), 'warn'),
+				E('span', { 'style': 'opacity:.6;font-size:12px;margin-left:8px;' },
+					[ status.epgIds > 0
+						? _('拉取失败，暂时沿用上一次的结果')
+						: _('拉取失败，将在 5 分钟后自动重试') ])
+			]);
+		}
+
+		/* ---------------- 运行指标（1.4.0） ---------------- */
+		var hitPct = status.chHitRatePct || 0;
+		var hitBadge = hitPct >= 80 ? 'ok' : (hitPct >= 40 ? 'info' : 'dim');
+		var cacheNode = E('span', {}, [
+			badge(_('命中 ') + hitPct + '%', hitBadge),
+			' ',
+			E('span', { 'style': 'font-size:12px;opacity:.75;' }, [
+				_('成功') + ' ' + (status.chCacheHits || 0) +
+				' / ' + _('未命中') + ' ' + (status.chCacheMisses || 0)
+			])
+		]);
+
+		// 取流地址缓存 + 失败缓存
+		var ttlNode = E('span', {}, [
+			mono((status.streamTtl || 0) + 's'),
+			E('span', { 'style': 'opacity:.6;font-size:12px;margin-left:6px;' }, [ _('成功') ]),
+			' / ',
+			mono((status.failTtl || 0) + 's'),
+			E('span', { 'style': 'opacity:.6;font-size:12px;margin-left:6px;' }, [ _('失败') ]),
+			(status.streamTtl === 0 || status.failTtl === 0)
+				? badge(_('有缓存已关闭'), 'warn')
+				: ''
+		]);
+
+		// 降级链：走备用源的次数（版权盾时段会升高）
+		var fbText = (status.chFallback || 0) > 0
+			? E('span', {}, [
+				mono(status.chFallback + ' ' + _('次')),
+				E('span', { 'style': 'opacity:.6;font-size:12px;margin-left:6px;' },
+					[ _('咪咕取流失败后由备用源顶替') ])
+			])
+			: mono('0');
+
+		var metrics = E('div', { 'class': 'cbi-section' }, [
+			E('h3', {}, [ _('运行指标') ]),
+			E('p', { 'style': 'opacity:.8;margin:6px 0 12px;' }, [
+				_('服务本次启动以来的累计数据（重启后归零）。'),
+				' ',
+				_('「缓存命中率」偏低通常是因为刚开始用、或频道换得比较分散。')
+			]),
+			E('div', {}, [
+				row(_('频道请求'), mono((status.chRequests || 0) + ' ' + _('次')),
+					status.avgResolveMs ? _('平均解析') + ' ' + status.avgResolveMs + ' ms' : ''),
+				row(_('缓存命中率'), cacheNode),
+				row(_('缓存时长'), ttlNode),
+				row(_('降级次数'), fbText),
+				row(_('节目单（EPG）'), epgNode,
+					status.epgUrl ? mono(status.epgUrl) : ''),
+				row(_('并发连接'), mono((status.activeConns || 0) + ' / ' + (status.maxConns || 64)),
+					(status.rejectedByLimit || 0) > 0
+						? _('已拒绝') + ' ' + status.rejectedByLimit + ' ' + _('个超限连接')
+						: '')
 			])
 		]);
 
@@ -398,7 +486,7 @@ return view.extend({
 					'class': 'btn cbi-button cbi-button-action',
 					'style': 'margin-left:6px;',
 					'click': ui.createHandlerFn(this, function () {
-						return callLogs(40).then(function (r) {
+						return callLogs(LOG_LINES).then(function (r) {
 							var ls = (r && r.lines) ? r.lines : [];
 							dom.content(logBox, ls.length ? ls.join('\n') : _('（暂无日志）'));
 							ui.addNotification(null, E('p', {}, [ _('日志已刷新。') ]), 'info');
@@ -417,6 +505,7 @@ return view.extend({
 			E('div', { 'class': 'cbi-map-descr' },
 				[ _('咪咕视频直播频道 → TV-BOX 可订阅的 M3U 播放列表。配置项请到「设置」页。') ]),
 			overview,
+			metrics,
 			control,
 			subscribe
 		].concat(pubSubscribe, [

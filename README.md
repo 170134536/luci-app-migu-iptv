@@ -2,9 +2,11 @@
 
 把**咪咕视频**的直播频道转成 TV-BOX 能直接订阅的标准 **M3U 播放列表**，并在播放时按需换取咪咕流地址、302 重定向到最终 HLS 流。
 
-- 路由器原生运行，**无需 Node.js / Docker / Python**，只用 ucode + curl + openssl。
+- 路由器原生运行，**无需 Node.js / Docker / Python**，只用 ucode + curl。
 - **纯 LuCI 应用**：全部配置在路由器「服务 → 咪咕直播」里完成，没有独立管理网页。
 - 游客模式最高 540p；填咪咕账号到 720p；VIP 到蓝光 1080p / 原画 / 4K。
+- **内置 EPG 映射**：自动把频道名转成播放器认识的 `tvg-id`，电视盒节目单直接可用。
+- **零外部进程签名**：取流签名走 ucode 原生 MD5，不再 fork `openssl`。
 
 > 参考实现：[akiralereal/iptv](https://github.com/akiralereal/iptv)（Node.js 版）。
 > 本项目用 ucode 重写其核心算法：频道列表接口 + playurl 签名 + ddCalcu 解密 + 302 跟随。
@@ -17,7 +19,7 @@
 
 | 页面 | 路径 | 作用 |
 | --- | --- | --- |
-| **设置** | 服务 → 咪咕直播 → 设置 | 服务开关、监听端口/地址、画质档位、H.265/HDR、缓存、调试日志、咪咕账号（userId + token，密码框输入） |
+| **设置** | 服务 → 咪咕直播 → 设置 | 服务开关、监听端口/地址、画质档位、H.265/HDR、缓存、取流/失败缓存 TTL、并发上限、EPG 来源与刷新、调试日志、咪咕账号（userId + token，密码框输入） |
 | **运行状态** | 服务 → 咪咕直播 → 运行状态 | 运行状态徽章、服务控制（启动/停止/重启）、TV-BOX 订阅地址（可点选复制）、频道测试、频道分组统计、服务日志 |
 
 **「保存 & 应用」会写 UCI 并自动重启服务**，无需手动去「系统 → 启动项」重启。
@@ -30,11 +32,16 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| `GET /m3u` | M3U 播放列表（分组、台标、频道名），TV-BOX 订阅用 |
+| `GET /m3u` | M3U 播放列表（分组、台标、频道名、EPG `tvg-id`），TV-BOX 订阅用 |
 | `GET /txt` | TXT 播放列表（`频道名,地址` 一行一条） |
 | `GET /ch/<pID>` | 按需取流：换咪咕流地址 → 302 重定向到最终 HLS |
-| `GET /health` | 服务状态 JSON（频道数、游客/账号、画质） |
+| `GET /health` | 服务状态 JSON（版本、频道数、缓存命中、解析耗时、EPG 状态、并发数） |
 | `GET /` | 302 跳转到 LuCI 的咪咕直播页 |
+
+对外提供两种订阅写法（公网访问时令牌二选一）：
+
+- 路径前缀（推荐）：`http://地址:端口/<令牌>/m3u`
+- 查询参数：`http://地址:端口/m3u?token=<令牌>`
 
 TV-BOX 里订阅地址就是 `http://路由器IP:8788/m3u`。
 
@@ -51,14 +58,14 @@ TV-BOX 里订阅地址就是 `http://路由器IP:8788/m3u`。
 ```sh
 cp -r luci-app-migu-iptv package/
 make package/luci-app-migu-iptv/compile V=s
-# 产物：bin/packages/.../luci-app-migu-iptv_1.2.0-1_all.ipk
+# 产物：bin/packages/.../luci-app-migu-iptv_1.4.0-1_all.ipk
 ```
 
 路由器上安装：
 
 ```sh
-apk add --allow-untrusted luci-app-migu-iptv_1.2.0-1_all.ipk
-# 老版本 OpenWrt 用：opkg install luci-app-migu-iptv_1.2.0-1_all.ipk
+apk add --allow-untrusted luci-app-migu-iptv_1.4.0-1_all.ipk
+# 老版本 OpenWrt 用：opkg install luci-app-migu-iptv_1.4.0-1_all.ipk
 ```
 
 ### 方式 B：手动部署
@@ -89,11 +96,14 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
 /etc/init.d/migu start
 ```
 
-依赖（缺一不可）：`ucode`、`ucode-mod-fs`、`ucode-mod-uloop`、`ucode-mod-socket`、`ucode-mod-uci`、`curl`、`openssl-util`、`rpcd`、`luci-base`。
+依赖（缺一不可）：`ucode`、`ucode-mod-fs`、`ucode-mod-uloop`、`ucode-mod-socket`、`ucode-mod-uci`、`ucode-mod-digest`、`curl`、`rpcd`、`luci-base`。
 
 ```sh
-apk add ucode ucode-mod-fs ucode-mod-uloop ucode-mod-socket ucode-mod-uci curl openssl-util rpcd luci-base
+apk add ucode ucode-mod-fs ucode-mod-uloop ucode-mod-socket ucode-mod-uci ucode-mod-digest curl rpcd luci-base
 ```
+
+> `ucode-mod-digest` 是 1.3.0 起新增的依赖（取流签名改用原生 MD5，不再 fork `openssl`）。
+> 1.2.x 及更早版本用的是 `openssl-util`；升级后它不再是必需项，如无其它程序使用可以卸载。
 
 ---
 
@@ -110,9 +120,69 @@ apk add ucode ucode-mod-fs ucode-mod-uloop ucode-mod-socket ucode-mod-uci curl o
 | `enableH265` | `1` | H.265（部分设备只有声无画时关） |
 | `enableHDR` | `1` | HDR |
 | `cacheMinutes` | `360` | 频道列表缓存分钟数 |
+| `externalSources` | 空 | 降级备用源，每行 `标签\|URL` |
+| `publicAccess` | `0` | 允许公网访问 |
+| `publicToken` | 空 | 公网访问令牌（建议生成 32 位） |
+| `publicBaseUrl` | 空 | 对外访问地址（留空 = 按请求 Host 推断） |
 | `debug` | `0` | 调试日志 |
 
+### 1.4.0 新增选项
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `streamTtl` | `300` | 取流地址缓存秒数（`0` = 不缓存，上限 3600）。实测咪咕下发的地址复用性很好，缓久一点能显著减少切台耗时 |
+| `failTtl` | `15` | **失败**结果的缓存秒数（`0` = 不缓存，上限 300）。版权盾时段失败是间歇性的，缓太久会把临时失败放大成一直失败；完全不缓存又会让连点重试每次都等一轮完整解析 |
+| `maxConns` | `64` | 最大并发连接数（4~4096）。超出直接拒绝，防止单客户端刷请求占满单线程事件循环 |
+| `epgUrl` | `https://live.fanmingming.cn/e.xml` | EPG 来源，用于把频道名映射成标准 `tvg-id`。**留空不能关闭 EPG**：UCI 存不下空字符串，清空后会回落到内置默认源 |
+| `epgRefreshHours` | `12` | EPG 刷新间隔（0~168 小时）。**设为 `0` 才是关闭 EPG**（此时 `tvg-id` 退回频道名、节目单为空）。拉取失败会自动改为 5 分钟后重试 |
+| `warmRecent` | `4` | 启动时预热「最近看过」的频道数（0~12）。开机后首次点开可秒开 |
+
 超出账号权益时会自动降级到咪咕愿意给的档位（例如游客要 4K 会一路降到 540p）。
+
+---
+
+## 四·一、性能与运行数据（实机实测）
+
+在京东云 RE-SS-01（IPQ60xx / 4 核 / 968MB RAM，ImmortalWrt SNAPSHOT）上实测：
+
+| 项目 | 改造前 | 1.4.0 |
+| --- | --- | --- |
+| 冷取流 `/ch/<pid>` | 0.48 ~ 0.78s | 0.59s |
+| 热取流（缓存命中） | 0.0018s | 0.0021s |
+| 失败结果重试 | 每次重解析 1.28s | 0.0021s（`failTtl` 内） |
+| 取流签名开销 | 6 个进程 / 约 30~40ms | 0 进程（原生 MD5） |
+| 进程常驻内存 | 2920 kB | 3016 kB |
+| 频道数 / 分组 | 174 / 11 | 174 / 11 |
+| EPG `tvg-id` 映射 | 无（`x-tvg-url=""` 写死为空） | 77 / 178 命中 |
+| 播放中拉取 EPG 是否卡顿 | — | 不阻塞，`/m3u` 与 `/ch` 均 ~0.01s |
+| 100 次请求后内存增长 | — | +80 kB（无泄漏，fd 恒为 10） |
+
+### 端到端播放链路实测（1.4.0）
+
+不只看「返回 302」，而是把整条链跟到底，确认真的出数据：
+
+| 环节 | 结果 |
+| --- | --- |
+| `/ch/608807420` | 302 → `mgsp-hs2.live.miguvideo.com:8088/wd_r2/cctv/cctv1hd/2500/index.m3u8`，带 `client_ip=` |
+| master 列表 | 200 / 702 B，指向 `01.m3u8`（码率 2084544） |
+| variant 列表 | 200 / 2771 B，4 个 `#EXTINF` 分片，`TARGETDURATION:6` |
+| TS 分片 | **200 / 2846132 B / 39 MB/s**，首字节 `0x47`（MPEG-TS 同步字节）✔ |
+| 三个频道冷/热 | 0.002s / 0.967s / 0.549s → 热均为 ~0.002s |
+| 外部备用源 pid 9002 | 302，0.09s |
+| 公网侧鉴权 | WAN 无令牌 403、错令牌 403、正确令牌 200 ✔ |
+
+> 未映射的 101 条不是缺陷：其中 4 条是外部备用源（本就无节目单），其余是 EPG 源里
+> 确实没有的地方台（南京/江苏/陕西/海南各频道）、熊猫频道与咪咕自制轮播台。
+> 央视全部与主流卫视均已正确映射。
+
+`/health` 会返回完整运行指标，便于排查：
+
+```json
+{ "version": "1.4.0", "channels": 174, "chRequests": 2, "chCacheHits": 1,
+  "chHitRatePct": 50, "avgResolveMs": 590, "chFallback": 1,
+  "activeConns": 1, "maxConns": 64, "streamTtl": 300, "failTtl": 15,
+  "epgIds": 124, "epgOk": true, "denied": 0, "rejectedByLimit": 0 }
+```
 
 ---
 

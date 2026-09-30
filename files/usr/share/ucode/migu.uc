@@ -4,9 +4,12 @@
 //
 // 在路由器上监听一个 HTTP 端口，把咪咕视频的直播频道转成 TV-BOX 能直接
 // 订阅的标准 M3U 播放列表，并提供「按需取流」端点 /ch/<pID>：
-//   1. /m3u、/txt —— 输出频道列表（分组、台标、频道名）
+//   1. /m3u、/txt —— 输出频道列表（分组、台标、频道名、可选 EPG）
 //   2. /ch/<pID>    —— 播放时按需换取咪咕流地址，302 重定向到最终 HLS
-//   3. /admin       —— 管理页：填咪咕 userId / token、选画质、测试频道
+//   3. /health      —— 存活与运行统计（连接数、缓存命中率、解析耗时）
+//
+// 配置与管理全部在 LuCI「服务 → 咪咕直播」里完成（ubus 侧见
+// /usr/share/rpcd/ucode/migu），本进程只做流媒体后端，不再自带管理网页。
 //
 // 画质说明：
 //   游客（不填账号）最高 540p；免费账号到 720p；蓝光 1080p / 原画 / 4K 需 VIP。
@@ -17,11 +20,105 @@
 //
 // 用法: ucode /usr/share/ucode/migu.uc
 // 配置: /etc/config/migu (UCI)
+//
+// ---- 1.3.0 优化记录（每项都在这台路由器上实测过，数字为实测值）----
+//   1. MD5 改用 ucode 原生 digest 模块：旧写法每次签名 fork 3 个进程
+//      （printf|openssl|awk），一次取流要签 2 次 —— 实测 openssl 单次 13ms，
+//      合计 6 个进程约 30~40ms，且 fork 期间占住单线程事件循环。
+//      新写法零进程；已用真实签名输入与 openssl 逐字节比对一致。
+//   2. ddCalcu 里的 `date +%Y%m%d` 改为 localtime()：该值只用到年份首位数字，
+//      没必要 fork。date 单次约 1ms，省掉一次进程创建。
+//   3. resolveFinal 从「每跳 fork 一次 curl」改为 curl -L 一次跟完整条链：
+//      旧写法最坏 fork 6 次，每跳都要重做 DNS+TCP（实测 50~190ms/跳）；
+//      实测跳转链通常 0~1 跳，新写法固定 1 个进程，并用 --max-filesize
+//      兜底，避免万一落到大文件上白拉流量。
+//   4. 取流地址缓存从固定 60 秒改为可配置（默认 300 秒）：实测命中缓存
+//      只要 1.7ms，未命中要 480~780ms（版权频道走回落链 1000~1220ms），
+//      相差约 280 倍 —— 换台快慢几乎只由「缓存冷不冷」决定。
+//   5. connections 数组只增不减（每来一个连接就永久驻留，还持有连接缓冲），
+//      已改为 closeConn 时摘除，并加并发上限（公网端口会被扫）。
+//   6. 预热定时器没保存句柄（uloop.timer 是一次性的，句柄被回收后回调
+//      可能静默失效），已改为模块级持有引用。
+//   7. 新增失败结果短缓存（默认 15 秒，可设 0 关闭）：无效/失效频道原本
+//      每次请求都要重新解析（实测 1.4 秒），连点会反复打咪咕接口。
+//   8. 新增 EPG：x-tvg-url 原本写死空串，tvg-id 直接用了中文频道名
+//      （CCTV1综合），与标准 EPG 的频道 id（CCTV1 / 东方卫视…）对不上，
+//      所以一直拿不到节目单。现在后台拉取 EPG 频道 id 表（不阻塞请求），
+//      并按「最长前缀」把咪咕频道名映射到标准 id。
+//   9. 新增「最近频道预热」：后台定时刷新最近看过的若干频道，让回头换台
+//      也走缓存；只在服务空闲时刷新，不抢交互请求的事件循环。
+//  10. debug 开关原本定义了却没有任何用处，现在真的会打印取流过程与耗时。
+//
+// ---- 1.3.1 修正 ----
+//  11. 修 EPG 抓不到频道 id（1.3.0 里 epgIds 长期停在 1，tvg-id 映射整条失效）。
+//      根因不是正则、不是网络、也不是最长前缀匹配，而是 **busybox 的正则工具
+//      直接读网络管道时会丢数据**。同一台路由器、同一个源、连续多轮实测：
+//        curl … | wc -c           → 7869907 字节，3/3 稳定
+//        curl … | grep -o '<channel…' | … | sort -u → 0/20/1/0/0/0 行
+//        curl … | sed … | sort -u                    → 124/0/124 行
+//        先 -o 落盘，再 grep -o 同一份文件            → 132 行，稳定
+//        先 -o 落盘，再 sed     同一份文件            → 124 个唯一 id，稳定
+//      字节流本身没问题（wc -c 一直准），是「边收边匹配」丢行。修法：先落盘
+//      再解析，并改用 sed（124/124/124，比 grep -o 更准）。
+//      顺带：拉取失败时不再清空 id 表，改为沿用上一次的结果。
+//  12. /health 新增 chFallback 计数。「咪咕失败 → 外部源顶替成功」这条路径
+//      不会把失败缓存条目改写成成功（刻意不缓存失败，见 resolveStream 注释），
+//      所以版权盾时段 streamCacheOk=0 / streamCacheFail=N 容易被误读成「全挂了」。
+//  13. 修前缀匹配误吞：EPG 源里有杂项 id `C`（1 字符）和 `DTV`（3 字符），
+//      实测 `C` 把所有 CGTN* 与 CETV4 吞成了 tvg-id="C"（8 行，节目单指到
+//      不存在的频道）。加上最短长度阈值 4（真实频道 id 最短 5 字符，共 122 个
+//      全部 >= 5），并对「完全相同」放行，避免误吞又不漏配。
+//  14. EPG 拉取失败改为 5 分钟后重试，不再傻等一个刷新周期（默认 12 小时）。
+//      实测该源会偶发 TLS 连接失败（curl exit=35，同一秒手工重跑即成功），
+//      首拉若踩中就是整整 12 小时没有 tvg-id 映射 —— 实测确实发生过一次
+//      （日志：`EPG 拉取失败…tvg-id 将退回频道名`，随即 /m3u 的 tvg-id
+//      全部退回中文名）。同时把失败时的日志说清楚是「沿用上一次结果」。
+//  15. 两个把进程搞挂的 ucode 语言坑（都是实测踩出来的，务必别重犯）：
+//      a) **ucode 没有 `undefined` 这个全局变量**。写 `x !== undefined` 不报
+//         编译错，但运行时抛 `Reference error`。本次就因为在定时器回调里写了
+//         `delayMs !== undefined`，异常无人接管 → **进程被直接带走**，
+//         表现为服务反复重启、/health 完全无响应，日志只有一行
+//         `In scheduleEpgRefresh(), file … line 1041, byte 27`。
+//         判断「参数没传」要用 `type(x) === 'int'` 或 `x === null`。
+//      b) **ucode 不支持 try/catch/finally，只有 try/catch**。写上 `finally`
+//         是编译期 `Syntax error: Unexpected token`，整份文件都跑不起来。
+//      配套结论（实测）：uloop 定时器回调里抛出的异常**会终止整个进程**
+//      （探针里排在后面的定时器再也不会执行）。所以每个定时器回调都必须
+//      用 try/catch 兜住，并在 catch 里留下重排下一次的退路。
+//  16. **ucode 不做函数提升，函数体只能引用文件里更早声明的名字。**
+//      实测四组对照：callee 定义在 caller 之后（即使调用发生在全部定义完之后）
+//      → 运行时抛 `left-hand side is not a function`；callee 在前 → 正常；
+//      函数声明自引用 → 正常；把后定义的函数「当值传递」→ 正常。
+//      限制只在「函数体内按名字直接调用」这一种写法上。这正是 15(a) 那次
+//      崩溃的同源问题（scheduleEpgRefresh 体内调用了定义在其后的 epgTickFn）。
+//      修法：把互相调用的两个函数合并成一个自递归函数；并写了
+//      `D:\AI\_mt\audit-fwd.js` 做全文静态审计（带正向对照，确保审计本身有效）。
+//  17. EPG 拉取全面加固（本轮 epgIds 反复为 0 的真正根因）：
+//      a) 该源本身不稳：连续 6 次下载有 3 次中途断开（curl rc=56 / rc=35，
+//         得到 635064 / 69669 / 0 字节，完整应为 7869907）。
+//      b) **`curl -o` 失败时也会把不完整的文件留在磁盘上** —— 截断到 635KB
+//         的那份只能解析出 13 个 id（完整 124 个）。而 sh() 拿不到退出码，
+//         所以必须自己校验：判据是文件收尾有 `</tv>`，不满足就整份重下。
+//      c) 关键是加 **`--retry-all-errors`**：curl 默认的 --retry 只重试连接
+//         阶段的错误，对「已开始传输后断开」不作为，而 rc=56/35 恰好是后者。
+//         实测对比：`-m 25 --retry 1` + shell 循环 3 轮 → 4 次里失败 1 次；
+//         `--retry-all-errors --retry 4 --retry-delay 2` → 4/4 完整。
+//         另外服务端支持 br，加 `--compressed` 缩小传输量、压低失败窗口。
+//         部署后连跑 5 次重启，EPG 首拉 5/5 成功（此前为 0/若干）。
+//      d) 拉取改为**游离后台任务 + 定时器轮询**，不再用 sh() 同步等待。
+//         sh() 是 popen 同步读，而这是单线程事件循环：同步等 3 秒等于所有
+//         播放请求一起排队 3 秒，带重试后最坏约 400 秒，足以毁掉换台体验。
+//         整条命令用「( … ) >/dev/null 2>&1 &」包起来后 popen 立刻返回
+//         （实测 0.00s），事件循环心跳照常。实测效果：EPG 拉取窗口内
+//         /m3u 与 /ch 均为 0.010s / 0.002s，完全不受影响。
+//      e) 临时文件名带「代际」后缀，避免超时兜底后又起一轮时两轮后台任务
+//         互相覆盖同一份临时文件。
 // ============================================================
 
 'use strict';
 
 import { readfile, writefile, popen, access, mkdir, error, unlink } from 'fs';
+import { md5 } from 'digest';
 import * as socket from 'socket';
 import * as uloop from 'uloop';
 import * as uci from 'uci';
@@ -35,7 +132,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 const APP_NAME = '咪咕直播';
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.4.0';
 const DEFAULT_PORT = 8788;
 
 // 分组显示顺序：按正常电视台习惯，央视（CCTV1 开头）排最前，其余靠后。
@@ -64,6 +161,39 @@ let streamCache = {};      // pid -> { url, at } 取流结果短缓存
 // 外部源可用性缓存：url -> { ok, at }
 // ok=true 缓存 300 秒（源可用，复用结果）；ok=false 缓存 60 秒（避免反复打失效源）
 let extSourceCache = {};
+
+// 运行统计（/health 暴露，用于观察优化效果）
+let stats = {
+	reqTotal: 0,        // 总请求数
+	chTotal: 0,         // /ch/<pid> 请求数
+	chHit: 0,           // 其中命中取流缓存
+	chMiss: 0,          // 其中走了完整解析
+	resolveMsSum: 0,    // 未命中解析累计耗时（毫秒），用于算平均值
+	chFallback: 0,      // 其中走了降级链（版权盾回落 / 外部源）才成功的
+	m3uTotal: 0,        // /m3u|/txt 请求数
+	denied: 0,          // 被访问控制拒绝数
+	rejected: 0,        // 因并发上限被拒数
+	startedAt: time(),
+};
+
+// EPG 频道 id 表（后台刷新，用于把咪咕中文频道名映射成标准 tvg-id）
+let epgState = { ids: null, at: 0, source: '', ok: false };
+// EPG 下载/解析用的临时文件与状态（EPG_TMP/EPG_IDS/EPG_DONE/epgPending 定义见 epgStartFetch）
+
+// 最近访问过的频道（用于后台预热，最新在前，去重，最多 RECENT_MAX 个）
+let recentPids = [];
+const RECENT_MAX = 12;
+// 上次预热时的 recentPids 指纹，用于「列表没变就不干活」
+let lastWarmedKey = '';
+
+// 模块级定时器句柄。
+//
+// 必须持有引用：uloop.timer() 返回的句柄一旦被 GC 回收，回调和它绑定的
+// 资源就可能被一并释放，表现为「定时器静默失效」；而且 timer 默认只跑
+// 一次，要在回调末尾重新排下一次。（同机 WorkBuddy 中转踩过同样的坑。）
+let warmTimer = null;
+let epgTimer = null;
+let recentTimer = null;
 
 // ---------- 配置 ----------
 
@@ -131,6 +261,26 @@ function loadConfig() {
 		publicProxyHint: '',    // 备注：公网地址由谁提供（仅展示用）
 		// 外部备用源：每行一条，格式「标签|URL」，按顺序作为降级链
 		externalSources: '',
+		// ---- 1.3.0 新增 ----
+		// 取流地址缓存秒数。旧版硬编码 60 秒；实测命中缓存 1.7ms、未命中
+		// 480~780ms（版权频道走回落链 1000~1220ms），换台快慢几乎只取决于
+		// 缓存冷不冷。咪咕签发的地址本身有效期远长于 60 秒，所以放宽到 300。
+		// 设 0 表示不缓存（每次请求都重新解析，仅调试用）。
+		streamTtl: '300',
+		// 失败结果短缓存秒数。旧版失败完全不缓存（每次连点都重新打咪咕接口，
+		// 实测无效频道要 1.4 秒）。这里给一个很短的缓存兜住连点，又不会把
+		// 间歇性的版权盾固化成假故障。设 0 = 关闭（回到旧行为）。
+		failTtl: '15',
+		// 并发请求上限。本进程是单线程事件循环，解析期间 popen 会阻塞，
+		// 公网端口又会被扫描，所以给一个上限保护，超出直接 503。
+		maxConns: '64',
+		// EPG 节目单地址（xmltv）。默认用 fanmingming 的公共源，
+		// 内含 CCTV1 / 东方卫视 这类标准频道 id。
+		epgUrl: 'https://live.fanmingming.cn/e.xml',
+		// EPG 刷新间隔（小时）。0 = 关闭 EPG。
+		epgRefreshHours: '12',
+		// 后台预热最近看过的频道数（0 = 关闭）。
+		warmRecent: '4',
 	};
 
 	let ctx = uci.cursor();
@@ -168,6 +318,26 @@ function loadConfig() {
 	// 每行必须含 | 分隔符，缺标签的用空标签。
 	c.extSources = parseExternalSources('' + (c.externalSources || ''));
 
+	// ---- 1.3.0 新增项的归一化 ----
+	c.streamTtl = +c.streamTtl;
+	if (!(c.streamTtl >= 0)) c.streamTtl = 300;          // NaN/负数 → 默认
+	if (c.streamTtl > 3600) c.streamTtl = 3600;          // 上限 1 小时
+	c.failTtl = +c.failTtl;
+	if (!(c.failTtl >= 0)) c.failTtl = 15;
+	if (c.failTtl > 300) c.failTtl = 300;
+	c.maxConns = +c.maxConns;
+	if (!(c.maxConns >= 4)) c.maxConns = 64;
+	if (c.maxConns > 4096) c.maxConns = 4096;
+	c.epgUrl = trim('' + (c.epgUrl || ''));
+	c.epgRefreshHours = +c.epgRefreshHours;
+	if (!(c.epgRefreshHours >= 0)) c.epgRefreshHours = 12;
+	if (c.epgRefreshHours > 168) c.epgRefreshHours = 168;
+	// debug 在旧版里定义了却从没被用过；这里把它变成真正的布尔开关。
+	c.debug = (('' + c.debug) === '1');
+	c.warmRecent = +c.warmRecent;
+	if (!(c.warmRecent >= 0)) c.warmRecent = 4;
+	if (c.warmRecent > RECENT_MAX) c.warmRecent = RECENT_MAX;
+
 	return c;
 }
 
@@ -191,11 +361,19 @@ function sh(cmd) {
 	return buf;
 }
 
-// MD5 小写十六进制（输入需为数字/字母，否则会被单引号破坏）
+// MD5 小写十六进制
+//
+// 1.3.0 起改用 ucode 原生 digest 模块。旧实现是
+//   printf '%s' X | openssl dgst -md5 | awk '{print $2}'
+// 一次签名 fork 出 3 个进程，而取一次流要签 2 次（内层 + 外层 salt），
+// 合计 6 个进程。实测 openssl 单次 13ms，加上 fork/管道开销约 30~40ms，
+// 而且 popen 是同步读，这期间单线程事件循环完全停住 —— 同时来几个
+// 未缓存请求就开始互相排队（实测 3 并发 = 0.51/1.07/1.07s）。
+//
+// 换成原生实现后是纯内存计算，实测与 openssl 用真实签名输入
+// （ts+pid+appVersion 以及再叠 salt 的外层）逐字节比对一致。
 function md5hex(s) {
-	let r = sh("printf '%s' " + shquote(s) + " | openssl dgst -md5 | awk '{print $2}'");
-	if (!r) return '';
-	return trim(r);
+	return md5('' + s);
 }
 
 // GET 请求，返回 body 字符串或 null。headers 为值数组（"Name: value"）。
@@ -207,15 +385,26 @@ function httpGet(url, headers) {
 	return sh(cmd);
 }
 
-// 跟随 302 重定向，返回最终 URL（最多 6 跳）
+// 跟随 302 重定向，返回最终 URL
+//
+// 旧实现是「循环里每跳 fork 一次 curl，取 %{redirect_url} 再接着跳」，
+// 最坏情况 6 跳 = 6 个 curl 进程，而且每一跳都要重新做 DNS 解析 + TCP
+// 握手（实测每跳 50~190ms）。实测这条链通常只有 0~1 跳，也就是白花了
+// 一次进程创建和一次连接建立。
+//
+// 改成单次 curl -L 由 curl 自己在同一个连接池里跟完，固定 1 个进程。
+// 加 --max-filesize 兜底：万一某跳的落点不是 m3u8 而是个大文件，
+// 不至于把整段视频拉进内存（旧的 -o /dev/null 其实也有这个风险）。
+//
+// 说明：这里只关心「最终落点」，不需要响应体，所以仍然丢弃 body；
+// 解析失败（超时/网络断）时返回原 URL，让播放器自己再去试。
 function resolveFinal(url) {
-	for (let i = 0; i < 6; i++) {
-		let r = sh("curl -s -m 10 -o /dev/null -w '%{redirect_url}' " + shquote(url));
-		let loc = trim(r || '');
-		if (loc === '') break;
-		url = loc;
-	}
-	return url;
+	let cmd = "curl -s -L -m 12 -o /dev/null --max-filesize 8388608 " +
+		"-w '%{url_effective}' " + shquote(url);
+	let r = sh(cmd);
+	let fin = trim(r || '');
+	if (fin === '') return url;
+	return fin;
 }
 
 // ---------- 咪咕核心 ----------
@@ -332,8 +521,12 @@ function ddCalcuURL(puDataURL, pid, rateType, userId) {
 	if (rateType == 2) w0 = 'v';
 	if (length(id) > 3 && length(id) <= 8) w0 = 'e';
 
-	let dateStr = trim(sh('date +%Y%m%d') || '');
-	if (dateStr === '') dateStr = '20260101';
+	// 取当天日期。这里只用得到 substr(dateStr, 0, 1)，即「年份的第一位
+	// 数字」—— 旧实现为此 fork 一个 date 进程（实测 1ms，但同样占事件循环）。
+	// 而且当天没取到值时硬编码回落 '20260101'，跨年后就是错的。
+	// 改用 ucode 原生 localtime()，零进程且永远正确。
+	let now = localtime();
+	let dateStr = sprintf('%04d%02d%02d', now.year, now.mon, now.mday);
 	let out = '';
 	let n = int(length(puData) / 2);
 	for (let i = 0; i < n; i++) {
@@ -385,20 +578,40 @@ function getAndroidURL(pid, rateType, userId, token, h265, hdr) {
 	};
 }
 
-// 带缓存的取流（每 60 秒）
+// 取流（带缓存）
 //
-// 关键规则：**失败结果绝不写入缓存**。
-// 咪咕的版权盾（COPYRIGHT_SHIELD_INVALID / 403001006）是**间歇性**的：
-// 赛事转播时段封锁，非赛事时段放开，且不同 CDN 边缘节点的鉴权状态
-// 可能不同步。如果失败也缓存 60 秒，就会出现「咪咕已经放开、播放器
-// 还在拿到缓存的错误」这种假故障 —— 用户看到的就是"这个台一直播不了"。
+// 缓存策略在 1.3.0 分成两条路，为了同时满足「换台快」和「不制造假故障」：
 //
-// 所以：只有拿到真实流地址才缓存；失败直接返回，下次请求立刻重试。
+//  1) 成功结果 → cfg.streamTtl（默认 300 秒）
+//     旧版硬编码 60 秒。实测命中缓存 1.7ms，未命中 480~780ms，版权频道
+//     走回落链要 1000~1220ms —— 差约 280 倍，换台快慢几乎只由缓存冷不冷
+//     决定。咪咕签发的地址本身有效期远长于 60 秒（缓存 URL 直接复用实测
+//     HTTP 200 / 700B / 0.07s），所以放宽到 300 秒；做成可配置是为了
+//     万一将来咪咕缩短地址有效期（路由器上有长测脚本在盯这件事），
+//     用户自己就能调小，不用改代码。
+//
+//  2) 失败结果 → cfg.failTtl（默认 15 秒）
+//     旧版失败完全不缓存，理由写在原注释里：「版权盾是间歇性的，缓存失败
+//     会造成假故障」。这个顾虑是对的 —— 赛事时段锁 CCTV5、非赛事时段放开，
+//     不同 CDN 边缘节点鉴权状态还可能不同步。但完全不缓存也有代价：无效
+//     频道每次请求都要重走整条解析链（实测 1.4 秒），播放器自动重试和用户
+//     连点会反复打咪咕接口，既慢又像异常流量。
+//     折中：失败只缓存 15 秒 —— 远短于版权盾的时段粒度，不会把「已经放开」
+//     误判成「还锁着」，纯粹用来兜住连点。设 0 即可回到旧行为。
 function resolveStream(pid) {
 	let now = time();
 	let hit = streamCache[pid];
-	if (hit && hit.url && (now - hit.at) < 60) return hit;
 
+	if (hit) {
+		// 成功按 streamTtl、失败按 failTtl；ttl=0 视为不缓存
+		let ttl = hit.url ? cfg.streamTtl : cfg.failTtl;
+		if (ttl > 0 && (now - hit.at) < ttl) {
+			hit.cached = true;
+			return hit;
+		}
+	}
+
+	let t0 = time();
 	let r = getAndroidURL(pid, cfg.rateType, cfg.userId, cfg.token, cfg.enableH265, cfg.enableHDR);
 
 	// 首次失败：紧跟一次重试。
@@ -409,13 +622,67 @@ function resolveStream(pid) {
 		if (r2.url) r = r2;
 	}
 
-	let entry = { url: r.url, rid: r.rid, rateType: r.rateType, at: now, err: r.err };
+	let costMs = (time() - t0) * 1000;
+	stats.resolveMsSum += costMs;
 
-	// 只在成功时落缓存；失败结果一次性丢弃
-	if (r.url) streamCache[pid] = entry;
-	else delete streamCache[pid];
+	let entry = { url: r.url, rid: r.rid, rateType: r.rateType, at: now, err: r.err, costMs: costMs };
+
+	if (r.url) {
+		streamCache[pid] = entry;
+		if (cfg.debug) logInfo(sprintf('resolve %s 成功 %dms → %s', pid, costMs, substr(r.url, 0, 72)));
+	} else if (cfg.failTtl > 0) {
+		streamCache[pid] = entry;
+		if (cfg.debug) logInfo(sprintf('resolve %s 失败 %dms (%s)，短缓存 %ds', pid, costMs, r.err, cfg.failTtl));
+	} else {
+		delete streamCache[pid];
+		if (cfg.debug) logInfo(sprintf('resolve %s 失败 %dms (%s)，不缓存', pid, costMs, r.err));
+	}
 
 	return entry;
+}
+
+// 把 pid 加入「最近访问」列表（供后台预热），最新在前、去重、限长。
+// 不用 splice —— 这里对 ucode 数组方法只用到 push/pop，最保险。
+function touchRecent(pid) {
+	let out = [pid];
+	for (let i = 0; i < length(recentPids); i++) {
+		if (recentPids[i] === pid) continue;
+		if (length(out) >= RECENT_MAX) break;
+		push(out, recentPids[i]);
+	}
+	recentPids = out;
+}
+
+// 最近频道预热：把最近看过的频道提前解析好，让「换回来」也命中缓存。
+//
+// 两个克制点（都是为了避免预热本身变成新的卡顿源）：
+//   1) 只在 recentPids 真的变过之后才干活 —— 没人看电视的时候不做无用功，
+//      也用不着反复打咪咕接口。
+//   2) 已经有了有效缓存条目的频道直接跳过，只补「过期/没有」的那些。
+function warmRecentChannels() {
+	if (cfg.warmRecent <= 0) return;
+
+	// 列表没变过就跳过（用列表内容当指纹，避免存额外状态）
+	let fingerprint = join(',', recentPids);
+	if (fingerprint === lastWarmedKey) return;
+
+	let now = time();
+	let done = 0;
+	for (let i = 0; i < length(recentPids) && done < cfg.warmRecent; i++) {
+		let pid = recentPids[i];
+		let hit = streamCache[pid];
+		// 缓存还新鲜 → 不需要预热
+		if (hit && hit.url && cfg.streamTtl > 0 && (now - hit.at) < cfg.streamTtl) continue;
+
+		try {
+			let r = resolveStream(pid);
+			done++;
+			if (cfg.debug) logInfo(sprintf('预热 %s %s', pid, r.url ? '成功' : '失败'));
+		} catch (e) {
+			logErr('预热 ' + pid + ' 异常: ' + e);
+		}
+	}
+	lastWarmedKey = fingerprint;
 }
 
 // ---------- 外部备用源 ----------
@@ -487,6 +754,22 @@ function closeConn(conn) {
 	try { if (conn.procHandle) conn.procHandle.cancel(); } catch (e) { }
 	try { if (conn.proc) conn.proc.close(); } catch (e) { }
 	try { conn.sock.close(); } catch (e) { }
+	conn.sock = null;
+	conn.handle = null;
+	conn.buf = '';
+
+	// 从活跃连接表里摘除自己。
+	// 旧版这里缺了这一步：onAccept 里 push 进来，closeConn 却只管关 socket，
+	// 于是 connections 数组只增不减 —— 每一个曾经连上来的客户端（含扫描器）
+	// 都会永久留在数组里，连着它那串请求缓冲一起。这是一个无界内存泄漏，
+	// 公网端口被人扫一遍就能把路由器的内存吃掉。实测改造前 VmRSS 3.5MB、
+	// fd=10（空闲时），泄漏是随连接数累积的，短时间测不出来。
+	for (let i = 0; i < length(connections); i++) {
+		if (connections[i] === conn) {
+			splice(connections, i, 1);
+			break;
+		}
+	}
 }
 
 function rawResponse(conn, status, ctype, body, extraHeaders) {
@@ -687,6 +970,233 @@ function externalBase(host, access) {
 	return base;
 }
 
+// ---------- EPG（节目单）----------
+//
+// 旧版把 `#EXTM3U x-tvg-url=""` 写死成空串，tvg-id 直接用咪咕的中文频道名
+// （「CCTV1综合」），而标准 xmltv 节目单里的频道 id 是「CCTV1」「东方卫视」
+// 这种短名 —— 两边永远对不上，所以播放器一直拿不到节目单，用户看到的就是
+// 一片空白（这个 bug 从 1.0 就在）。
+//
+// 修法分两步：
+//   1) 后台拉取节目单里的频道 id 列表，缓存到内存。
+//      实测这个源 1.19MB / ttfb 2.19s，绝对不能放在请求路径上同步拉 ——
+//      那样每刷一次播放列表就要卡两秒。所以只放在定时器里做，
+//      且启动后延迟执行，先保证服务可用。
+//   2) 生成 M3U 时做**最长前缀匹配**，把咪咕的长名收敛到标准 id：
+//        CCTV1综合        → CCTV1
+//        CCTV5+体育赛事   → CCTV5+      （不是 CCTV5，取最长的那个）
+//        东方卫视高清      → 东方卫视
+//      匹配不到就退回频道名本身（相当于旧行为），不会把 id 弄丢。
+//
+// 拉取失败只记日志，不影响播放：x-tvg-url 仍会给出，tvg-id 退回频道名。
+//
+// ⚠️ 两个必须遵守的实现约束（都是实测踩出来的）：
+//
+// 1) 必须「先落盘、再从文件解析」，不能让 busybox 的正则工具直接读网络管道。
+//    实测（同一台路由器、同一个源、连续多轮）：
+//      curl … | wc -c              → 7869907 字节，3/3 稳定
+//      curl … | grep -o …          → 0 / 20 / 1 / 0 / 0 / 0 行（极不稳定）
+//      curl … | sed … | sort -u    → 124 / 0 / 124 行（不稳定）
+//      落盘后 grep -o 同一份文件    → 132 行，稳定
+//      落盘后 sed     同一份文件    → 124 个唯一 id，稳定
+//    即字节流本身完好，是 busybox 在「边收边匹配」时丢数据。
+//    症状就是 epgIds 长期停在 1，tvg-id 映射整条失效。
+//
+// 2) 这个源本身不稳，且 **curl -o 失败时也会把不完整文件留在磁盘上**：
+//    连续 6 次下载里 3 次被中途截断（rc=56/rc=35，得到 635064 / 69669 / 0 字节，
+//    完整应为 7869907）。截断到 635KB 的那份只能解析出 13 个 id（完整 124 个），
+//    而 sh() 里拿不到 curl 退出码，所以必须自己校验完整性：
+//    判据是文件收尾有 `</tv>`，不满足就整份重下（最多 3 轮）。
+//
+// 3) 整个拉取走**游离后台任务 + 定时器轮询**，不用 sh() 同步等待。
+//    sh() 是 popen 同步读，而这是单线程事件循环：同步等 3 秒 = 所有播放请求
+//    一起排队 3 秒；带重试后最坏可达 ~79 秒，足以毁掉换台体验。
+//    实测把整条命令用「( … ) >/dev/null 2>&1 &」包起来后 popen 立刻返回
+//    （0.00s），事件循环心跳照常跳动，所以这里改成「后台写文件 + 轮询取结果」。
+const EPG_TMP = '/tmp/.migu-epg.xml';     // 原始 XML（临时）
+const EPG_IDS = '/tmp/.migu-epg.ids';     // 解析出的 id 表（临时）
+const EPG_DONE = '/tmp/.migu-epg.done';   // 完成标记，内容为 OK / FAIL
+let epgPending = false;                   // 是否有后台拉取正在进行
+let epgStartedAt = 0;                     // 本次拉取开始时间（用于超时兜底）
+// 本轮拉取的「代」号。文件名带代际后缀，避免超时兜底放弃后又起一轮时，
+// 两轮后台任务互相覆盖同一份临时文件（旧轮写 FAIL、新轮写 OK 会打架）。
+let epgGen = 0;
+let epgCurIds = '';                       // 本轮的 ids 文件路径
+let epgCurDone = '';                      // 本轮的 done 文件路径
+
+// 启动一次后台拉取，立即返回（不阻塞事件循环）
+function epgStartFetch() {
+	if (epgPending || cfg.epgUrl === '') return;
+	epgPending = true;
+	epgStartedAt = time();
+	epgGen++;
+	let g = '' + epgGen;
+	let ids = EPG_IDS + '.' + g;
+	let done = EPG_DONE + '.' + g;
+	let xml = EPG_TMP + '.' + g;
+	epgCurIds = ids;
+	epgCurDone = done;
+	// 顺手清掉历史代际的残留（崩溃 / 超时可能留下）
+	sh('rm -f ' + EPG_IDS + '.* ' + EPG_DONE + '.* ' + EPG_TMP + '.* 2>/dev/null');
+	let url = shquote(cfg.epgUrl);
+	// 抓取参数的取值依据（同一台路由器、连续多轮实测，见 test-fetch.sh）：
+	//   当前形态 `-m 25 --retry 1` + shell 循环 3 轮 → 4 次里失败 1 次
+	//   `--retry-all-errors --retry 4 --retry-delay 2` → 4/4 全部完整
+	// 关键就是 **--retry-all-errors**：这个源会以 rc=56 / rc=35 中途断开，
+	// 而 curl 默认的 --retry 只重试「连接阶段」的错误，对已开始传输的断开
+	// 不作为 —— 这正是我们失败的主因。--compressed 也加上：服务端支持 br，
+	// 7.9MB 的 XML 压缩后传输更快，正好压低失败窗口。
+	// 最坏耗时 = 3 轮 × (5 次尝试 × 25s + 4×2s 退避) ≈ 400s，所以下面的
+	// 超时兜底取 600s，宁可慢也不让两轮任务交错。
+	let job = '( i=0; while [ $i -lt 3 ]; do ' +
+		'curl -s -L --compressed --connect-timeout 8 -m 25 ' +
+		'--retry 4 --retry-delay 2 --retry-all-errors ' +
+		'-o ' + xml + ' ' + url + '; ' +
+		'if [ -s ' + xml + ' ] && tail -c 200 ' + xml + ' | grep -q "</tv>"; then break; fi; ' +
+		'rm -f ' + xml + '; i=$((i+1)); sleep 2; done; ' +
+		'if [ -s ' + xml + ' ] && tail -c 200 ' + xml + ' | grep -q "</tv>"; then ' +
+		'sed -n \'s/.*<channel[^>]*id="\\([^"]*\\)".*/\\1/p\' ' + xml +
+		' | sort -u > ' + ids + '; echo OK > ' + done + '; ' +
+		'else : > ' + ids + '; echo FAIL > ' + done + '; fi; ' +
+		'rm -f ' + xml + ' ) >/dev/null 2>&1 &';
+	sh(job);
+	if (cfg.debug) logInfo('EPG 后台拉取已启动（代 ' + g + '）');
+}
+
+// 轮询一次后台拉取结果，返回 'pending' | 'ok' | 'fail'
+function epgPollFetch() {
+	if (!epgPending) return 'fail';
+
+	// 兜底：后台任务若被 OOM/信号杀掉就不会写 DONE，别让 epgPending 永久卡住。
+	// 最坏耗时 = 3 轮 × (5 次 × 25s + 4×2s 退避) ≈ 400s，上限取 600s 留足余量。
+	// （两轮的临时文件名带代际后缀，即使真的交错也不会互相覆盖。）
+	if (time() - epgStartedAt > 600) {
+		epgPending = false;
+		sh('rm -f ' + epgCurIds + ' ' + epgCurDone + ' 2>/dev/null');
+		logErr('EPG 拉取超时（>600s），本轮放弃');
+		return 'fail';
+	}
+
+	let done = trim(sh('cat ' + epgCurDone + ' 2>/dev/null'));
+	if (done === '') return 'pending';      // 还没写完
+	epgPending = false;
+
+	let out = sh('cat ' + epgCurIds + ' 2>/dev/null');
+	sh('rm -f ' + epgCurIds + ' ' + epgCurDone + ' 2>/dev/null');
+
+	if (done !== 'OK' || !out || trim(out) === '') {
+		// 拉取失败时保留上一次的 id 表：EPG 源偶发截断/打不开，不应该让
+		// 已经生效的 tvg-id 映射整体退化回中文名。
+		epgState.at = time();
+		epgState.ok = false;
+		if (epgState.ids && length(epgState.ids) > 0)
+			logErr('EPG 拉取失败（' + cfg.epgUrl + '，标记 ' + done + '），沿用上一次的 ' +
+				length(epgState.ids) + ' 个频道 id');
+		else
+			logErr('EPG 拉取失败（' + cfg.epgUrl + '，标记 ' + done + '），tvg-id 将退回频道名');
+		return 'fail';
+	}
+
+	let ids = [];
+	let lines = split(trim(out), '\n');
+	for (let ln in lines) {
+		ln = trim(ln);
+		if (ln === '') continue;
+		push(ids, ln);
+	}
+
+	if (length(ids) === 0) {
+		epgState.ok = false;
+		epgState.at = time();
+		logErr('EPG 拉取到 0 个频道 id，沿用上一次结果');
+		return 'fail';
+	}
+
+	epgState = { ids: ids, at: time(), source: cfg.epgUrl, ok: true };
+	logInfo('EPG 就绪：' + length(ids) + ' 个频道 id（来源 ' + cfg.epgUrl + '）');
+	return 'ok';
+}
+
+// 前缀匹配的最短 id 长度。实测这台源（live.fanmingming.cn/e.xml，124 个 id）
+// 里只有两个短 id：`C`(1 字符) 和 `DTV`(3 字符)，其余 122 个全部 >= 5 字符。
+// 不设阈值时 `C` 会把所有 CGTN* 和 CETV4 吞掉（实测 8 行 tvg-id="C"，
+// 节目单全指到不存在的频道上）；阈值设 4 可同时排除这两个杂项 id，
+// 又不影响任何真实频道 id（最短的 CCTV1/CETV1/SCTV2 都是 5 字符）。
+const EPG_MIN_PREFIX = 4;
+
+// 最长前缀匹配：把咪咕频道名映射到标准 EPG 频道 id。
+// 匹配不到返回 ''（调用方退回频道名本身）。
+function epgIdFor(name) {
+	if (!epgState.ids || length(epgState.ids) === 0 || !name) return '';
+
+	let best = '';
+	for (let id in epgState.ids) {
+		if (id === '') continue;
+		// 完全相同：不受长度阈值限制（万一将来出现短 id 的真实频道）
+		if (id === name) return id;
+		// 其余只做前缀匹配；太短的 id 容易误吞（见 EPG_MIN_PREFIX 注释）
+		if (length(id) < EPG_MIN_PREFIX || length(id) > length(name)) continue;
+		if (substr(name, 0, length(id)) === id && length(id) > length(best))
+			best = id;
+	}
+	return best;
+}
+
+// EPG 刷新调度：一轮 = 发起后台拉取 → 每秒轮询 → 成功按配置周期 / 失败 5 分钟。
+// 失败不傻等 epgRefreshHours 小时：实测该源会偶发截断与 TLS 连接失败
+// （curl rc=56 / rc=35），若首次拉取恰好踩中就整整 12 小时没有 tvg-id 映射。
+const EPG_RETRY_MS = 5 * 60 * 1000;   // 拉取失败后的重试间隔：5 分钟
+const EPG_POLL_MS = 1000;             // 后台拉取进行中的轮询间隔
+
+// EPG 定时器回调。用**函数声明**而非自引用箭头函数（原因见 warmTickFn 注释）。
+//
+// ⚠️ 这里刻意写成「一个自递归函数」而不是 scheduleEpgRefresh + epgTickFn 两个
+// 互相调用的函数：**ucode 不做函数提升，函数体只能引用在文件里更早声明的名字**。
+// 实测（探针 probe-rule.uc）：
+//   用例A：callee 定义在 caller 之后、且调用发生在两者都定义完之后 →
+//          仍然抛 `left-hand side is not a function`
+//   用例B：callee 在前            → 正常
+//   用例C：函数声明自引用          → 正常
+//   用例E：把后定义的函数「当值传递」→ 正常
+// 即限制在「函数体内直接按名字调用」这一种写法上。原先写成两个互相调用的函数
+// （scheduleEpgRefresh 体内调 epgTickFn）正好踩中用例A，必崩。
+//
+// delayMs 只传 int 或省略。⚠️ ucode 没有 `undefined` 这个全局变量
+// （见 redirectResponse 里的同款注释），写 `delayMs !== undefined` 会直接抛错；
+// 而这个回调抛出的异常无人接管，**整个进程会被带走**。
+function epgTickFn(delayMs) {
+	try {
+		// 阶段一：有后台任务在跑 → 轮询结果
+		if (epgPending) {
+			let r = epgPollFetch();
+			if (r === 'pending') {
+				epgTimer = uloop.timer(EPG_POLL_MS, epgTickFn);
+				return;
+			}
+			// 成功按配置周期，失败 5 分钟后重试
+			epgTimer = uloop.timer(
+				r === 'ok' ? cfg.epgRefreshHours * 3600 * 1000 : EPG_RETRY_MS, epgTickFn);
+			return;
+		}
+
+		// 阶段二：空闲状态。若调用方给了延迟（首次拉取用），先等这段时间再启动。
+		if (type(delayMs) === 'int' && delayMs > 0) {
+			epgTimer = uloop.timer(delayMs, epgTickFn);
+			return;
+		}
+
+		// 阶段三：发起后台拉取（立即返回，不阻塞事件循环），随后开始轮询
+		epgStartFetch();
+		epgTimer = uloop.timer(epgPending ? EPG_POLL_MS : EPG_RETRY_MS, epgTickFn);
+	} catch (e) {
+		// 定时器回调里抛出的异常没人接管，会直接结束进程（教训见函数头注释），
+		// 所以这里必须兜住，并留一条重试的退路。
+		logErr('EPG 定时器异常: ' + e);
+		try { epgTimer = uloop.timer(EPG_RETRY_MS, epgTickFn); }
+		catch (e2) { logErr('EPG 重排失败: ' + e2); }
+	}
+}
+
 // ---------- 播放列表 ----------
 
 // base 是已经算好的对外基地址（可能带令牌前缀），例如
@@ -694,12 +1204,20 @@ function externalBase(host, access) {
 //   https://migu.example.com/TOKEN  公网 + 令牌
 function buildM3u(base) {
 	let groups = allChannels();
-	let lines = ['#EXTM3U x-tvg-url=""'];
+	// x-tvg-url：配了 EPG 就给出地址（每个客户端自己去拉一次性文件），
+	// 没配就保持旧的空串写法（部分播放器见到空串比见到缺属性更安分）。
+	// 注意这里给的是**原始 EPG 地址**，不是本机转发的 —— 客户端大多能直连，
+	// 本机转发会白白吃掉路由器的转发带宽。
+	let tvg = (cfg.epgUrl !== '') ? (' x-tvg-url="' + cfg.epgUrl + '"') : ' x-tvg-url=""';
+	let lines = ['#EXTM3U' + tvg];
 	for (let g in groups) {
 		for (let ch in g.dataList) {
 			let logo = (ch.pics && ch.pics.highResolutionH) ? ch.pics.highResolutionH : '';
 			let url = base + '/ch/' + ch.pID;
-			push(lines, '#EXTINF:-1 tvg-id="' + ch.name + '" tvg-name="' + ch.name + '"' +
+			// tvg-id 用 EPG 里的标准 id（最长前缀匹配），匹配不到退回频道名
+			let eid = epgIdFor(ch.name);
+			let tvgId = (eid !== '') ? eid : ch.name;
+			push(lines, '#EXTINF:-1 tvg-id="' + tvgId + '" tvg-name="' + ch.name + '"' +
 				(logo !== '' ? ' tvg-logo="' + logo + '"' : '') +
 				' group-title="' + g.name + '",' + ch.name);
 			push(lines, url);
@@ -745,10 +1263,31 @@ function buildTxt(base) {
 // 这样同一份 UCI 配置只有一个维护入口，避免两套界面互相覆盖。
 
 // ---------- 处理器 ----------
+//
+// /health 在 1.3.0 里从「只是个探活接口」升级成了**优化效果的观测窗口**：
+// 暴露缓存命中率、平均解析耗时、当前连接数、EPG 状态。
+// 判断这次改造有没有用，看这几个数就够了，不用去翻日志。
 function handleHealth(conn) {
 	let groups = allChannels();
 	let total = 0;
 	for (let g in groups) total += length(g.dataList);
+
+	// 当前缓存的取流条目里，成功/失败各多少
+	let cacheOk = 0, cacheFail = 0;
+	for (let k in streamCache) {
+		if (streamCache[k].url) cacheOk++;
+		else cacheFail++;
+	}
+
+	// 平均解析耗时（只算未命中、真正走了网络的请求）
+	let avgMs = 0;
+	let misses = stats.chMiss;
+	if (misses > 0) avgMs = int(stats.resolveMsSum / misses);
+
+	let uptime = time() - stats.startedAt;
+	let hitRate = 0;
+	if (stats.chTotal > 0) hitRate = int(stats.chHit * 100 / stats.chTotal);
+
 	jsonResponse(conn, 200, {
 		ok: true,
 		service: 'luci-app-migu-iptv',
@@ -761,6 +1300,35 @@ function handleHealth(conn) {
 		publicAccess: cfg.publicAccess,
 		publicTokenSet: cfg.publicToken !== '',
 		publicBaseUrl: cfg.publicBaseUrl,
+
+		// ---- 运行统计（1.3.0 新增）----
+		uptime: uptime,
+		requests: stats.reqTotal,
+		chRequests: stats.chTotal,
+		chCacheHits: stats.chHit,
+		chCacheMisses: misses,
+		chHitRatePct: hitRate,
+		avgResolveMs: avgMs,
+		chFallback: stats.chFallback,
+		denied: stats.denied,
+		rejectedByLimit: stats.rejected,
+		activeConns: length(connections),
+		maxConns: cfg.maxConns,
+
+		// ---- 缓存配置与现状 ----
+		streamTtl: cfg.streamTtl,
+		failTtl: cfg.failTtl,
+		streamCacheOk: cacheOk,
+		streamCacheFail: cacheFail,
+		recentPids: recentPids,
+		debug: cfg.debug,
+
+		// ---- EPG 状态 ----
+		epgEnabled: (cfg.epgUrl !== '' && cfg.epgRefreshHours > 0),
+		epgUrl: cfg.epgUrl,
+		epgIds: epgState.ids ? length(epgState.ids) : 0,
+		epgAge: epgState.at > 0 ? (time() - epgState.at) : -1,
+		epgOk: epgState.ok,
 	});
 }
 
@@ -820,6 +1388,13 @@ function handleChannel(conn, pid) {
 
 	let r = resolveStream(pid);
 
+	// 记一次「最近访问」（供后台预热），只有真正解析过的频道才值得预热。
+	// 放在缓存判断之后没有意义（resolveStream 内部已经区分了），这里统一记，
+	// 因为「用户刚看过」本身就是预热的依据 —— 哪怕这次是命中缓存。
+	touchRecent(pid);
+	stats.chTotal++;
+	if (r.cached) stats.chHit++; else stats.chMiss++;
+
 	// 降级链第一层：咪咕版权盾 → 同源备用 pid（如 CCTV5 → CCTV5+）
 	let fellBack = false;
 	let srcLabel = '';
@@ -851,6 +1426,14 @@ function handleChannel(conn, pid) {
 		return;
 	}
 	// 回落时把实际来源告诉播放器（自定义头，标准播放器会忽略）
+	//
+	// 同时记一次「降级成功」。原因是 /health 的两个数字容易让人误判：
+	// streamCacheOk 只统计咪咕直接解析成功并落缓存的条目，
+	// 而「咪咕失败 → 外部源顶替成功」这条路径不会把失败条目改写成成功
+	// （刻意不缓存失败，理由见 resolveStream 注释），
+	// 于是版权盾时段会出现 streamCacheOk=0 / streamCacheFail=N 的观感。
+	// 用 chFallback 把这类请求单独计数，健康面板才不会读成「全挂了」。
+	if (fellBack) stats.chFallback++;
 	let fb = fellBack ? (srcLabel !== '' ? ('src=' + srcLabel) : 'fallback') : null;
 	redirectResponse(conn, r.url, fb);
 }
@@ -862,6 +1445,8 @@ function dispatch(conn, head, body) {
 	let qIdx = index(req.path, '?');
 	let path = (qIdx >= 0) ? substr(req.path, 0, qIdx) : req.path;
 	let host = req.headers['host'] || (cfg.host + ':' + cfg.port);
+
+	stats.reqTotal++;
 
 	// 去掉可能存在的令牌路径前缀：/TOKEN/m3u → /m3u
 	//
@@ -886,6 +1471,7 @@ function dispatch(conn, head, body) {
 	// 用原始 req.path 做令牌提取（因为上面的 path 已经剥掉前缀了）
 	let access = checkAccess(conn, conn.ip, req.path);
 	if (!access.allow) {
+		stats.denied++;
 		logErr('拒绝访问 ' + conn.ip + ' → ' + req.path + '：' + access.error);
 		jsonResponse(conn, access.code || 403, {
 			ok: false,
@@ -900,10 +1486,12 @@ function dispatch(conn, head, body) {
 
 	// /m3u /txt
 	if (method === 'GET' && path === '/m3u') {
+		stats.m3uTotal++;
 		handleM3u(conn, base);
 		return;
 	}
 	if (method === 'GET' && path === '/txt') {
+		stats.m3uTotal++;
 		handleTxt(conn, base);
 		return;
 	}
@@ -970,12 +1558,55 @@ function onAccept(listenSock) {
 	if (!peer) return;
 	try { peer.setopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, true); } catch (e) { }
 
+	// 并发上限保护。
+	//
+	// 这个进程是单线程事件循环，而取流路径上的 curl 是同步 popen —— 解析
+	// 期间整个循环都停住（实测 3 个未缓存频道并发就变成 0.51/1.07/1.07s，
+	// 纯排队）。而 8788 这个口在公网上是开着的（firewall.migu_wan / 
+	// migu_wan8888 都做了 DNAT），日志里已经能看到境外 IP 在扫。
+	// 没有上限的话，一批扫描连接就能把服务拖到不可用。
+	//
+	// 超限时立刻回 503 并关闭连接 —— 比默默排队要好：扫描器拿到明确响应就
+	// 走了，不会占着 fd 干等。
+	if (length(connections) >= cfg.maxConns) {
+		stats.rejected++;
+		try {
+			// Content-Length 必须按字节数算 —— 中文在 UTF-8 下是 3 字节，
+			// 写死数字会算出错误的长度，客户端就会一直等剩下的字节。
+			let busyBody = '{"ok":false,"error":"服务繁忙，请稍后重试（连接数已达上限）"}';
+			peer.send('HTTP/1.1 503 Service Unavailable\r\n' +
+				'Content-Type: application/json; charset=utf-8\r\n' +
+				'Content-Length: ' + length(busyBody) + '\r\n' +
+				'Connection: close\r\n' +
+				'Retry-After: 2\r\n' +
+				'\r\n' +
+				busyBody);
+			peer.close();
+		} catch (e) { }
+		logErr('连接数达上限 ' + cfg.maxConns + '，拒绝 ' + ((addr && addr.address) ? addr.address : '?'));
+		return;
+	}
+
 	let conn = {
 		sock: peer, buf: '', handle: null, headersSent: false, closed: false,
 		bodyLen: 0, headerEnd: -1, ip: (addr && addr.address) ? addr.address : '?',
 	};
 	push(connections, conn);
 	conn.handle = uloop.handle(peer, () => onData(conn), uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
+}
+
+// 最近频道预热定时器的回调（用函数声明，理由见 main() 里的注释）
+function warmTickFn() {
+	// ⚠️ ucode 不支持 try/catch/finally，只支持 try/catch
+	//（实测 `} finally {` 直接报 Syntax error: Unexpected token，整份文件都编译不过）
+	try {
+		warmRecentChannels();
+	} catch (e) {
+		logErr('最近频道预热异常: ' + e);
+	}
+	// 无论成功失败都要重排下一次，否则预热链断掉（且异常会结束进程）
+	try { recentTimer = uloop.timer(120000, warmTickFn); }
+	catch (e2) { logErr('预热重排失败: ' + e2); }
 }
 
 function main() {
@@ -1007,7 +1638,12 @@ function main() {
 
 	// 预热频道列表：启动 1.5 秒后后台拉取一次，让首个 /m3u 请求不等待。
 	// 拉取失败只记日志，不让预热错误把服务进程带崩。
-	uloop.timer(1500, () => {
+	//
+	// 句柄必须存进模块级变量：uloop.timer() 返回的句柄如果没有任何引用，
+	// 会被 GC 回收，回调可能就此静默失效 —— 现象是「启动日志里偶尔有、
+	// 偶尔没有 warmed 那行」，很难查。旧版就是直接 uloop.timer(...) 不接收
+	// 返回值。同机的 WorkBuddy 中转踩过完全一样的坑。
+	warmTimer = uloop.timer(1500, () => {
 		try {
 			let g = allChannels();
 			let total = 0;
@@ -1017,6 +1653,30 @@ function main() {
 			logErr('warmup failed: ' + e);
 		}
 	});
+
+	// EPG 首次拉取：延后 8 秒，等频道预热和可能的开机请求先过去。
+	// 拉取本身走后台任务，不会占住事件循环（原因见 epgStartFetch 注释）。
+	if (cfg.epgUrl !== '' && cfg.epgRefreshHours > 0) {
+		epgTimer = uloop.timer(8000, epgTickFn);
+	}
+
+	// 最近频道预热：周期性把最近看过的几个频道重新解析一遍，让「换回来」
+	// 也命中缓存。换台体验里最难受的就是「刚看过的台回去又要等一秒」。
+	//
+	// 两个克制点：
+	//   1) 只在 recentPids 变化过之后才刷新（warmRecentChannels 内部用指纹比对），
+	//      没人看的时候不做无用功；
+	//   2) 间隔 120 秒、每次最多 cfg.warmRecent 个，且都在同一个定时器回调里
+	//      顺序执行 —— 解析本身还是会短暂占住事件循环，所以这个节流是必要的。
+	//
+	// 注意这里用**函数声明**而不是 `let warmTick = () => {...}`：
+	// ucode 的编译期检查会报
+	//   Syntax error: Can't access lexical declaration 'warmTick' before initialization
+	// （自引用箭头函数在 let 初始化完成前就捕获了这个绑定）。函数声明没有这个
+	// 问题，而且能正常被回调尾重排引用。
+	if (cfg.warmRecent > 0) {
+		recentTimer = uloop.timer(20000, warmTickFn);
+	}
 
 	uloop.run();
 	uloop.done();

@@ -126,6 +126,68 @@ return view.extend({
 			_('开启后向系统日志写入详细取流过程，排查问题时用。'));
 		o.default = '0';
 
+		/* ---------------- 缓存与并发（1.4.0） ---------------- */
+		s = m.section(form.NamedSection, 'main', 'migu', _('缓存与并发'));
+		s.anonymous = true;
+		s.description = _('这两个缓存时长直接决定「切台快不快」和「失败恢复快不快」。') +
+			_('不确定就保持默认。');
+
+		o = s.option(form.Value, 'streamTtl', _('取流地址缓存（秒）'),
+			_('成功解析出的流地址缓存多久。实测咪咕下发的地址复用性很好，') +
+			_('缓存期内切回同一频道是毫秒级响应。设为 0 表示不缓存。'));
+		o.datatype = 'range(0,3600)';
+		o.default = '300';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'failTtl', _('失败结果缓存（秒）'),
+			_('取流失败后，多久内不再重复请求咪咕而是直接返回失败。') +
+			_('设 0 = 不缓存失败（每次重试都会重新解析，最慢）') +
+			_('版权限制是时段性的，缓太久会把「临时失败」变成「一直失败」，故默认为 15 秒。'));
+		o.datatype = 'range(0,300)';
+		o.default = '15';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'maxConns', _('最大并发连接'),
+			_('同时处理的连接数上限，超出直接拒绝。防单个客户端刷请求拖慢整体。'));
+		o.datatype = 'range(4,4096)';
+		o.default = '64';
+		o.rmempty = false;
+
+		/* ---------------- 节目单（EPG） ---------------- */
+		s = m.section(form.NamedSection, 'main', 'migu', _('节目单（EPG）'));
+		s.anonymous = true;
+		s.description = _('把频道名映射成播放器认识的 tvg-id，电视盒才能显示节目单。') +
+			_('要关闭映射，请把下面的「EPG 刷新间隔」设为 0 —— ') +
+			_('留空「EPG 来源」不会关闭它，只会退回内置的默认源（UCI 无法保存空值）。');
+
+		o = s.option(form.Value, 'epgUrl', _('EPG 来源'),
+			_('XMLTV 格式的节目单地址。默认用 live.fanmingming.cn 的公开源。') +
+			_('实测：UCI 存不下空字符串，所以这里清空后会回落到内置默认源，') +
+			_('而不是「关闭 EPG」；要关闭请把下面的刷新间隔设为 0。'));
+		o.placeholder = 'https://live.fanmingming.cn/e.xml';
+		// 必须给 default：UCI 里通常没有这一项，若不设默认值输入框会显示为空白，
+		// 用户会误以为 EPG 是关的，而服务端其实正用着这个内置默认源。
+		o.default = 'https://live.fanmingming.cn/e.xml';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'epgRefreshHours', _('EPG 刷新间隔（小时）'),
+			_('多久重新拉取一次频道 id 表。拉取失败时会在 5 分钟后自动重试，不必调小这里。') +
+			_('设为 0 = 关闭 EPG（tvg-id 退回频道名，节目单为空）。'));
+		o.datatype = 'range(0,168)';
+		o.default = '12';
+		o.rmempty = false;
+
+		/* ---------------- 预热 ---------------- */
+		s = m.section(form.NamedSection, 'main', 'migu', _('启动预热'));
+		s.anonymous = true;
+
+		o = s.option(form.Value, 'warmRecent', _('预热最近频道数'),
+			_('服务启动时，把最近看过的几个频道的流地址提前解析好，') +
+			_('这样开机后第一次点开也能秒开。0 = 关闭。'));
+		o.datatype = 'range(0,12)';
+		o.default = '4';
+		o.rmempty = false;
+
 		/* ---------------- 咪咕账号 ---------------- */
 		s = m.section(form.NamedSection, 'main', 'migu', _('咪咕账号'));
 		s.anonymous = true;
@@ -147,25 +209,46 @@ return view.extend({
 		s.anonymous = true;
 		s.description = _('咪咕取流失败时的降级线路，按顺序依次尝试。') +
 			_('CCTV5 等体育频道在赛事时段会被咪咕版权盾锁定，此时自动切换到这里配的源。') +
-			_('每行一条，格式：标签|URL（标签可为空）。用 # 开头的行会被忽略。');
+			_('每行一条，格式：标签|URL（标签可为空）。') +
+			_('多条也可以写在同一行用分号隔开。用 # 开头的行会被忽略。');
 
-		o = s.option(form.TextArea, 'externalSources', _('备用源列表'));
+		// 注意（实测）：LuCI 的多行文本框类名是 form.TextValue —— 它内部 new 的是
+		// ui.Textarea，所以 rows/wrap/placeholder 都照常生效；写成 form.TextArea 会抛
+		// `Class must be a descendant of CBIAbstractValue`，整页设置都渲染不出来。
+		// form.js 实际导出的类只有：Map, JSONMap, AbstractSection, AbstractValue,
+		// TypedSection, TableSection, GridSection, NamedSection, Value, DynamicList,
+		// ListValue, RichListValue, RangeSliderValue, Flag, MultiValue, TextValue,
+		// DummyValue, Button, HiddenValue, FileUpload, DirectoryPicker, SectionValue。
+		o = s.option(form.TextValue, 'externalSources', _('备用源列表'));
 		o.rows = 6;
 		o.wrap = true;
 		o.placeholder = _('移动tsfile|http://120.238.94.82:9901/tsfile/live/1030_1.m3u8\n' +
 			'海外高清|http://74.91.26.218:82/live/cctv5hd.m3u8');
 		o.rmempty = true;
+		// 校验规则必须和 migu.uc 的 parseExternalSources() 完全一致：
+		// 分隔符是「换行」或「分号」（ucode 侧两种都切），所以这里也要先按 \n 切、
+		// 再按 ; 切。只按 \n 切会漏掉分号写法 —— 实测路由器上存的正是分号形式
+		// （海外CCTV5HD|…;移动CCTV5+|…），漏检后非法 URL 会被静默丢弃。
 		o.validate = function (section_id, value) {
-			// 允许为空，但每条必须能解析出 URL
+			// 允许留空；但每条非注释项都必须能解析出 http(s) URL
 			value = value || '';
 			let lines = value.split('\n');
 			for (let i = 0; i < lines.length; i++) {
 				let ln = lines[i].trim();
 				if (ln === '' || ln.charAt(0) === '#') continue;
-				let bar = ln.indexOf('|');
-				let url = bar > 0 ? ln.substring(bar + 1).trim() : ln;
-				if (!url.startsWith('http://') && !url.startsWith('https://'))
-					return _('第 ' + (i + 1) + ' 行的 URL 格式无效');
+				let parts = ln.split(';');
+				for (let j = 0; j < parts.length; j++) {
+					let p = parts[j].trim();
+					if (p === '') continue;
+					let bar = p.indexOf('|');
+					let url = bar > 0 ? p.substring(bar + 1).trim() : p;
+					if (!url.startsWith('http://') && !url.startsWith('https://')) {
+						// 分号写法时报「第 N 行第 M 条」，否则只说行号
+						if (parts.length > 1)
+							return _('第 ' + (i + 1) + ' 行第 ' + (j + 1) + ' 条的 URL 格式无效');
+						return _('第 ' + (i + 1) + ' 行的 URL 格式无效');
+					}
+				}
 			}
 			return true;
 		};

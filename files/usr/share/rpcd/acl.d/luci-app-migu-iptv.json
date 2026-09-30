@@ -4,7 +4,7 @@
 		"read": {
 			"uci": [ "migu" ],
 			"ubus": {
-				"migu": [ "status", "channels", "logs" ]
+				"migu": [ "status", "channels", "logs", "testchannel" ]
 			}
 		},
 		"write": {

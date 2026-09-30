@@ -150,6 +150,13 @@ return {
 				// 监听 0.0.0.0 时对用户没用，交给前端用浏览器主机名拼
 				let hostForUrl = (conf.host === '0.0.0.0' || conf.host === '::') ? '' : conf.host;
 
+				// /health 里的运行指标（1.4.0 起提供）。老版本没有这些字段，
+				// 所以每个都按类型取值并给默认，前端始终能拿到稳定结构。
+				let h = health || {};
+				let num = function(k) { return (type(h[k]) === 'int') ? h[k] : 0; };
+				let str = function(k) { return (type(h[k]) === 'string') ? h[k] : ''; };
+				let bool = function(k) { return (type(h[k]) === 'bool') ? h[k] : false; };
+
 				return {
 					enabled: conf.enabled,
 					running: running,
@@ -180,6 +187,31 @@ return {
 					publicTokenLength: length('' + conf.publicToken),
 					publicBaseUrl: '' + (conf.publicBaseUrl || ''),
 					publicProxyHint: '' + (conf.publicProxyHint || ''),
+
+					// ---- 运行指标（1.4.0，来自 /health）----
+					uptime: num('uptime'),
+					requests: num('requests'),
+					denied: num('denied'),
+					rejectedByLimit: num('rejectedByLimit'),
+					activeConns: num('activeConns'),
+					maxConns: num('maxConns') || 64,
+					chRequests: num('chRequests'),
+					chCacheHits: num('chCacheHits'),
+					chCacheMisses: num('chCacheMisses'),
+					chHitRatePct: num('chHitRatePct'),
+					avgResolveMs: num('avgResolveMs'),
+					chFallback: num('chFallback'),
+					streamCacheOk: num('streamCacheOk'),
+					streamCacheFail: num('streamCacheFail'),
+					streamTtl: num('streamTtl'),
+					failTtl: num('failTtl'),
+					// ---- 节目单状态 ----
+					epgEnabled: bool('epgEnabled'),
+					epgUrl: str('epgUrl'),
+					epgIds: num('epgIds'),
+					epgAge: num('epgAge'),
+					epgOk: bool('epgOk'),
+					recentPids: (health && type(health.recentPids) === 'array') ? health.recentPids : [],
 				};
 			}
 		},
