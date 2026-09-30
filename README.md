@@ -58,14 +58,14 @@ TV-BOX 里订阅地址就是 `http://路由器IP:8788/m3u`。
 ```sh
 cp -r luci-app-migu-iptv package/
 make package/luci-app-migu-iptv/compile V=s
-# 产物：bin/packages/.../luci-app-migu-iptv_1.4.0-1_all.ipk
+# 产物：bin/packages/.../luci-app-migu-iptv_1.4.1-1_all.ipk
 ```
 
 路由器上安装：
 
 ```sh
-apk add --allow-untrusted luci-app-migu-iptv_1.4.0-1_all.ipk
-# 老版本 OpenWrt 用：opkg install luci-app-migu-iptv_1.4.0-1_all.ipk
+apk add --allow-untrusted luci-app-migu-iptv_1.4.1-1_all.ipk
+# 老版本 OpenWrt 用：opkg install luci-app-migu-iptv_1.4.1-1_all.ipk
 ```
 
 ### 方式 B：手动部署
@@ -178,11 +178,38 @@ apk add ucode ucode-mod-fs ucode-mod-uloop ucode-mod-socket ucode-mod-uci ucode-
 `/health` 会返回完整运行指标，便于排查：
 
 ```json
-{ "version": "1.4.0", "channels": 174, "chRequests": 2, "chCacheHits": 1,
+{ "version": "1.4.1", "channels": 174, "chRequests": 2, "chCacheHits": 1,
   "chHitRatePct": 50, "avgResolveMs": 590, "chFallback": 1,
   "activeConns": 1, "maxConns": 64, "streamTtl": 300, "failTtl": 15,
   "epgIds": 124, "epgOk": true, "denied": 0, "rejectedByLimit": 0 }
 ```
+
+### 1.4.1 修正：并发超限时的 503 会被 RST 吃掉
+
+`maxConns` 超限时服务端回 503 + `Retry-After: 2`。但旧写法发完 503 就**立刻**
+`close()`，而服务端从头到尾没读过这个连接的请求字节 —— Linux 在 `close()` 时
+若接收队列还有未读数据，会发 **RST 而不是 FIN**，RST 会让对端丢弃已到达的接收
+缓冲，于是刚写出去的 503 一起没了。客户端只看到 `ECONNRESET` 和 0 字节，日志里
+`rejectedByLimit` 却正常增长（服务端确实发了，只是没送达）。
+
+判别实验（每变体 3 轮 × 20 次 = 60 次，期望 218 字节）：
+
+| 变体 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 连上后立即发请求（接收队列非空） | **25/60 完整，丢包 35（58.3%）** | **60/60 完整，丢包 0** |
+| 连上后一个字节都不发（队列为空） | 60/60 完整，丢包 0 | 60/60 完整，丢包 0 |
+
+两者唯一差异就是接收队列是否为空，成因由此确定。修法是三步（缺一不可）：
+
+1. 发包前用 `recv(8192, MSG_DONTWAIT)` 把已排队的请求字节读干净（读空返回
+   `null` + EAGAIN，不阻塞事件循环）；
+2. 发完 503 先 `shutdown(SHUT_WR)` 再 `close()` —— shutdown 会老实发 FIN
+   （实测客户端读到 `len=0` 的干净 EOF）；
+3. shutdown 之后再补读一轮，覆盖「首次 recv 到 close 之间对端又补发字节」的窗口。
+
+读循环一律限次（16 轮），避免单线程事件循环被持续灌数据卡住。修复后复测
+`rejectedByLimit` 恰好等于 120（60+60 次探测全部真正走到拒绝分支），确认测的是
+目标路径而非被绕过。
 
 ---
 

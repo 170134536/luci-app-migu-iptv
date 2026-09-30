@@ -113,6 +113,32 @@
 //         /m3u 与 /ch 均为 0.010s / 0.002s，完全不受影响。
 //      e) 临时文件名带「代际」后缀，避免超时兜底后又起一轮时两轮后台任务
 //         互相覆盖同一份临时文件。
+//
+// ---- 1.4.1 修正 ----
+//  18. 修「并发超限时回 503，但约 58% 概率客户端收不到响应体」。
+//      现象：客户端表现为 `ECONNRESET` 且读到 0 字节，日志里 rejected 计数却
+//      正常增长 —— 服务端确实发了 503，只是没送达。
+//      成因：旧写法 `peer.send(503)` 后**立刻** `peer.close()`，而服务端从头到尾
+//      没 recv() 过这个连接。Linux 在 close() 时若接收队列还有未读数据，会发
+//      **RST 而不是 FIN**，RST 会让对端丢弃已到达的接收缓冲，于是刚写出去的
+//      503 一起被丢掉。
+//      判别实验（每变体 3 轮 × 20 次 = 60 次，EXPECT 218 字节）：
+//        - 连上后一个字节都不发（接收队列为空）→ **60/60 完整，丢包 0**
+//        - 连上后立即发请求（接收队列非空）  → **25/60 完整，丢包 35（58.3%）**
+//      两者唯一差异就是接收队列是否为空，理论成立。
+//      修法（三步，缺一不可）：
+//        a) 发包前用 `recv(8192, socket.MSG_DONTWAIT)` 把已排队的请求字节读干净
+//           （实测读空返回 null 且 error() 为 EAGAIN，不会阻塞事件循环）；
+//        b) 发完 503 先 `shutdown(socket.SHUT_WR)` 再 close —— shutdown 会老实
+//           发 FIN（实测客户端读到 len=0 的干净 EOF），避免 close() 因残留数据
+//           再次触发 RST；
+//        c) shutdown 之后再补读一轮，覆盖「首次 recv 到 close 之间对端又补发
+//           字节」的窗口（TCP 分段/慢启动都可能造成）。
+//      读循环一律限次（16 轮），保证单线程事件循环不会被持续的灌数据卡住。
+//      实测 socket 能力（在路由器临时口 18799 上验证，不打扰 8788）：
+//        `socket.MSG_DONTWAIT = 64`、`socket.SHUT_WR = 1`、`socket.SO_LINGER = 13`
+//      注意：`import { socket } from 'socket'` 会报 `Module does not export socket`，
+//      必须写 `import * as socket from 'socket'`。
 // ============================================================
 
 'use strict';
@@ -132,7 +158,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 const APP_NAME = '咪咕直播';
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.4.1';
 const DEFAULT_PORT = 8788;
 
 // 分组显示顺序：按正常电视台习惯，央视（CCTV1 开头）排最前，其余靠后。
@@ -1552,6 +1578,25 @@ function onData(conn) {
 	}
 }
 
+// 非阻塞地把一个连接上「已经排队」的请求字节读掉。
+//
+// 只用于拒绝路径：close() 之后如果接收队列还留着未读数据，Linux 会发 RST
+// 而不是 FIN，把刚写出去的 503 响应一起带走。读干净就不会 RST。
+//
+// 两个关键点：
+//   - MSG_DONTWAIT：读空时返回 null（error() 为 EAGAIN），不会阻塞事件循环。
+//     这个进程是单线程的，绝不能在拒绝路径上阻塞。
+//   - 限次：正常请求（哪怕带一堆头）几轮就空了；万一对端在灌数据，也不能
+//     让这个循环把事件循环占住，所以最多 maxRounds 轮就放弃（剩下的交给
+//     RST 兜底，不影响正确性）。
+function drainQueued(peer, maxRounds) {
+	for (let i = 0; i < maxRounds; i++) {
+		let chunk = null;
+		try { chunk = peer.recv(8192, socket.MSG_DONTWAIT); } catch (e) { return; }
+		if (chunk === null || length(chunk) === 0) return;
+	}
+}
+
 function onAccept(listenSock) {
 	let addr = {};
 	let peer = listenSock.accept(addr, socket.SOCK_CLOEXEC);
@@ -1571,6 +1616,32 @@ function onAccept(listenSock) {
 	if (length(connections) >= cfg.maxConns) {
 		stats.rejected++;
 		try {
+			// ---- 1.4.1 修正：拒绝路径必须先读走请求字节，否则 503 会被 RST 吃掉 ----
+			//
+			// 现象：改造后实测这条拒绝路径大约有 58% 的概率客户端收到
+			// ECONNRESET 且字节数为 0 —— 503 响应体根本没送达。
+			//
+			// 成因：send() 之后立刻 close()，而服务端从未 recv() 过这个连接。
+			// Linux 在 close() 时若发现接收队列还有未读数据，会发 RST 而不是 FIN；
+			// RST 会让对端丢弃已到达的接收缓冲，于是刚写出去的 503 一起被丢掉。
+			//
+			// 判别实验（各 60 次）：连上后一个字节都不发的变体丢包 0/60；
+			// 连上立即发请求的变体丢包 35/60（58.3%）——唯一差异就是接收队列是否为空。
+			//
+			// 修法分两步，缺一不可：
+			//   ① 用 MSG_DONTWAIT 把已排队的请求字节读干净（实测读空时返回 null
+			//      且 error() 为 EAGAIN，不会阻塞事件循环）；
+			//   ② 发完 503 后先 shutdown(SHUT_WR) 再 close()——shutdown 会老老实实
+			//      发 FIN（实测客户端读到 len=0 的干净 EOF），避免 close() 因残留
+			//      数据再次触发 RST。
+			//
+			// 代价：最多多 1 次 recv 系统调用。收益：503 稳定送达，扫描器/播放器
+			// 能拿到明确的「稍后重试」语义（Retry-After: 2），而不是连接重置。
+			//
+			// 代价：最多多几次 recv 系统调用。收益：503 稳定送达，扫描器/播放器
+			// 能拿到明确的「稍后重试」语义（Retry-After: 2），而不是连接重置。
+			drainQueued(peer, 16);
+
 			// Content-Length 必须按字节数算 —— 中文在 UTF-8 下是 3 字节，
 			// 写死数字会算出错误的长度，客户端就会一直等剩下的字节。
 			let busyBody = '{"ok":false,"error":"服务繁忙，请稍后重试（连接数已达上限）"}';
@@ -1581,6 +1652,12 @@ function onAccept(listenSock) {
 				'Retry-After: 2\r\n' +
 				'\r\n' +
 				busyBody);
+			// 先半关写方向（发出 FIN），再释放 fd
+			try { peer.shutdown(socket.SHUT_WR); } catch (e) { }
+			// 关闭前最后再收一次：从上面那次 recv 到现在，对端可能又补发了字节
+			// （TCP 分段或慢启动），close() 时队列非空依然会发 RST。多读一轮基本
+			// 覆盖这个窗口，代价可忽略。
+			drainQueued(peer, 16);
 			peer.close();
 		} catch (e) { }
 		logErr('连接数达上限 ' + cfg.maxConns + '，拒绝 ' + ((addr && addr.address) ? addr.address : '?'));
